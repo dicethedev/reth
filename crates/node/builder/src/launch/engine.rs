@@ -3,7 +3,10 @@
 use crate::{
     common::{Attached, LaunchContextWith, WithConfigs},
     hooks::NodeHooks,
-    rpc::{EngineShutdown, EngineValidatorAddOn, EngineValidatorBuilder, RethRpcAddOns, RpcHandle},
+    rpc::{
+        EngineSharedCaches, EngineShutdown, EngineValidatorAddOn, EngineValidatorBuilder,
+        RethRpcAddOns, RpcHandle,
+    },
     setup::build_networked_pipeline,
     AddOns, AddOnsContext, FullNode, LaunchContext, LaunchNode, NodeAdapter,
     NodeBuilderWithComponents, NodeComponents, NodeComponentsBuilder, NodeHandle, NodeTypesAdapter,
@@ -191,10 +194,18 @@ impl EngineNodeLauncher {
         };
         let validator_builder = add_ons.engine_validator_builder();
 
+        // Create launcher-owned engine shared caches (following ChangesetCache pattern)
+        let shared_caches = EngineSharedCaches::new();
+
         // Build the engine validator with all required components
         let engine_validator = validator_builder
             .clone()
-            .build_tree_validator(&add_ons_ctx, engine_tree_config.clone(), changeset_cache.clone())
+            .build_tree_validator_with_caches(
+                &add_ons_ctx,
+                engine_tree_config.clone(),
+                changeset_cache.clone(),
+                shared_caches,
+            )
             .await?;
 
         // Create the consensus engine stream with optional reorg
@@ -205,10 +216,16 @@ impl EngineNodeLauncher {
                 ctx.blockchain_db().clone(),
                 ctx.components().evm_config().clone(),
                 || async {
-                    // Create a separate cache for reorg validator (not shared with main engine)
+                    // Create separate caches for reorg validator (not shared with main engine)
                     let reorg_cache = ChangesetCache::new();
+                    let reorg_shared_caches = EngineSharedCaches::new();
                     validator_builder
-                        .build_tree_validator(&add_ons_ctx, engine_tree_config.clone(), reorg_cache)
+                        .build_tree_validator_with_caches(
+                            &add_ons_ctx,
+                            engine_tree_config.clone(),
+                            reorg_cache,
+                            reorg_shared_caches,
+                        )
                         .await
                 },
                 node_config.debug.reorg_frequency,

@@ -2,7 +2,7 @@
 
 pub use jsonrpsee::server::middleware::rpc::{RpcService, RpcServiceBuilder};
 use reth_engine_tree::tree::WaitForCaches;
-pub use reth_engine_tree::tree::{BasicEngineValidator, EngineValidator};
+pub use reth_engine_tree::tree::{BasicEngineValidator, EngineSharedCaches, EngineValidator};
 pub use reth_rpc_builder::{middleware::RethRpcMiddleware, Identity, Stack};
 pub use reth_trie_db::ChangesetCache;
 
@@ -1294,6 +1294,22 @@ pub trait EngineValidatorBuilder<Node: FullNodeComponents>: Send + Sync + Clone 
         tree_config: TreeConfig,
         changeset_cache: ChangesetCache,
     ) -> impl Future<Output = eyre::Result<Self::EngineValidator>> + Send;
+
+    /// Builds the tree validator with explicit launcher-owned cache facade.
+    ///
+    /// This is the cache-aware entrypoint that receives an [`EngineSharedCaches`] constructed
+    /// by the launcher. The default implementation ignores the shared caches and falls back
+    /// to [`Self::build_tree_validator`].
+    fn build_tree_validator_with_caches(
+        self,
+        ctx: &AddOnsContext<'_, Node>,
+        tree_config: TreeConfig,
+        changeset_cache: ChangesetCache,
+        shared_caches: EngineSharedCaches<Node::Evm>,
+    ) -> impl Future<Output = eyre::Result<Self::EngineValidator>> + Send {
+        let _ = shared_caches;
+        self.build_tree_validator(ctx, tree_config, changeset_cache)
+    }
 }
 
 /// Basic implementation of [`EngineValidatorBuilder`].
@@ -1342,6 +1358,22 @@ where
         tree_config: TreeConfig,
         changeset_cache: ChangesetCache,
     ) -> eyre::Result<Self::EngineValidator> {
+        self.build_tree_validator_with_caches(
+            ctx,
+            tree_config,
+            changeset_cache,
+            EngineSharedCaches::default(),
+        )
+        .await
+    }
+
+    async fn build_tree_validator_with_caches(
+        self,
+        ctx: &AddOnsContext<'_, Node>,
+        tree_config: TreeConfig,
+        changeset_cache: ChangesetCache,
+        shared_caches: EngineSharedCaches<Node::Evm>,
+    ) -> eyre::Result<Self::EngineValidator> {
         let validator = self.payload_validator_builder.build(ctx).await?;
         let data_dir = ctx.config.datadir.clone().resolve_datadir(ctx.config.chain.chain());
         let invalid_block_hook = ctx.create_invalid_block_hook(&data_dir).await?;
@@ -1355,6 +1387,7 @@ where
             invalid_block_hook,
             changeset_cache,
             ctx.node.task_executor().clone(),
+            shared_caches,
         ))
     }
 }

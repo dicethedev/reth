@@ -9,14 +9,16 @@ use tracing::debug;
 /// Type alias for the sparse trie type used in preservation.
 pub(super) type SparseTrie = SparseStateTrie<ConfigurableSparseTrie, ConfigurableSparseTrie>;
 
-/// Shared handle to a preserved sparse trie that can be reused across payload validations.
+/// Public handle to the preserved sparse trie cache.
 ///
-/// This is stored in [`PayloadProcessor`](super::PayloadProcessor) and cloned to pass to
-/// [`SparseTrieCacheTask`](super::sparse_trie::SparseTrieCacheTask) for trie reuse.
+/// This is a lightweight, cloneable handle that provides access to the sparse trie
+/// preserved across payload validations. It is owned by
+/// [`EngineSharedCaches`](super::EngineSharedCaches) and consumed by
+/// [`PayloadProcessor`](super::PayloadProcessor) during construction.
 #[derive(Debug, Default, Clone)]
-pub(super) struct SharedPreservedSparseTrie(Arc<Mutex<Option<PreservedSparseTrie>>>);
+pub struct PayloadSparseTrieCache(Arc<Mutex<Option<PreservedSparseTrie>>>);
 
-impl SharedPreservedSparseTrie {
+impl PayloadSparseTrieCache {
     /// Takes the preserved trie if present, leaving `None` in its place.
     pub(super) fn take(&self) -> Option<PreservedSparseTrie> {
         self.0.lock().take()
@@ -48,6 +50,37 @@ impl SharedPreservedSparseTrie {
             );
         }
         elapsed
+    }
+}
+
+/// Shared handle to a preserved sparse trie that can be reused across payload validations.
+///
+/// This is stored in [`PayloadProcessor`](super::PayloadProcessor) and cloned to pass to
+/// [`SparseTrieCacheTask`](super::sparse_trie::SparseTrieCacheTask) for trie reuse.
+#[derive(Debug, Default, Clone)]
+pub(super) struct SharedPreservedSparseTrie(PayloadSparseTrieCache);
+
+impl SharedPreservedSparseTrie {
+    /// Creates a new `SharedPreservedSparseTrie` from a [`PayloadSparseTrieCache`].
+    pub(super) fn new(cache: PayloadSparseTrieCache) -> Self {
+        Self(cache)
+    }
+
+    /// Takes the preserved trie if present, leaving `None` in its place.
+    pub(super) fn take(&self) -> Option<PreservedSparseTrie> {
+        self.0.take()
+    }
+
+    /// Acquires a guard that blocks `take()` until dropped.
+    /// Use this before sending the state root result to ensure the next block
+    /// waits for the trie to be stored.
+    pub(super) fn lock(&self) -> PreservedTrieGuard<'_> {
+        self.0.lock()
+    }
+
+    /// Waits until the sparse trie lock becomes available.
+    pub(super) fn wait_for_availability(&self) -> std::time::Duration {
+        self.0.wait_for_availability()
     }
 }
 

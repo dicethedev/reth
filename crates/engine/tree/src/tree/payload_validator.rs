@@ -4,7 +4,7 @@ use crate::tree::{
     cached_state::{CacheStats, CachedStateProvider},
     error::{InsertBlockError, InsertBlockErrorKind, InsertPayloadError},
     instrumented_state::{InstrumentedStateProvider, StateProviderStats},
-    payload_processor::PayloadProcessor,
+    payload_processor::{EngineSharedCaches, PayloadProcessor},
     precompile_cache::{CachedPrecompile, CachedPrecompileMetrics, PrecompileCacheMap},
     sparse_trie::StateRootComputeOutcome,
     CacheWaitDurations, EngineApiMetrics, EngineApiTreeState, ExecutionEnv, PayloadHandle,
@@ -192,14 +192,11 @@ where
         invalid_block_hook: Box<dyn InvalidBlockHook<N>>,
         changeset_cache: ChangesetCache,
         runtime: reth_tasks::Runtime,
+        shared_caches: EngineSharedCaches<Evm>,
     ) -> Self {
-        let precompile_cache_map = PrecompileCacheMap::default();
-        let payload_processor = PayloadProcessor::new(
-            runtime.clone(),
-            evm_config.clone(),
-            &config,
-            precompile_cache_map.clone(),
-        );
+        let precompile_cache_map = shared_caches.precompile_cache_map();
+        let payload_processor =
+            PayloadProcessor::new(runtime.clone(), evm_config.clone(), &config, shared_caches);
         Self {
             provider,
             consensus,

@@ -60,6 +60,7 @@ pub mod prewarm;
 pub mod receipt_root_task;
 pub mod sparse_trie;
 
+pub use preserved_sparse_trie::PayloadSparseTrieCache;
 use preserved_sparse_trie::{PreservedSparseTrie, SharedPreservedSparseTrie};
 
 /// Default parallelism thresholds to use with the [`ParallelSparseTrie`].
@@ -154,16 +155,20 @@ where
         &self.executor
     }
 
-    /// Creates a new payload processor.
+    /// Creates a new payload processor from the launcher-owned [`EngineSharedCaches`].
+    ///
+    /// The facade is destructured here — individual cache handles become private fields.
     pub fn new(
         executor: Runtime,
         evm_config: Evm,
         config: &TreeConfig,
-        precompile_cache_map: PrecompileCacheMap<SpecFor<Evm>>,
+        shared_caches: EngineSharedCaches<Evm>,
     ) -> Self {
+        let EngineSharedCaches { execution_cache, sparse_trie_cache, precompile_cache_map } =
+            shared_caches;
         Self {
             executor,
-            execution_cache: Default::default(),
+            execution_cache,
             trie_metrics: Default::default(),
             cross_block_cache_size: config.cross_block_cache_size(),
             disable_transaction_prewarming: config.disable_prewarming(),
@@ -171,7 +176,7 @@ where
             disable_state_cache: config.disable_state_cache(),
             precompile_cache_disabled: config.precompile_cache_disabled(),
             precompile_cache_map,
-            sparse_state_trie: SharedPreservedSparseTrie::default(),
+            sparse_state_trie: SharedPreservedSparseTrie::new(sparse_trie_cache),
             sparse_trie_max_hot_slots: config.sparse_trie_max_hot_slots(),
             sparse_trie_max_hot_accounts: config.sparse_trie_max_hot_accounts(),
             disable_sparse_trie_cache_pruning: config.disable_sparse_trie_cache_pruning(),
@@ -744,6 +749,52 @@ where
     }
 }
 
+/// Launcher-owned facade that groups the caches shared across engine payload processing.
+///
+/// This type is created once by [`EngineNodeLauncher`] and threaded through the engine validator
+/// build path, following the same ownership pattern as [`ChangesetCache`]. The facade is
+/// destructured by [`PayloadProcessor::new()`] — the individual cache handles become private
+/// fields and internal access sites remain unchanged.
+///
+/// [`EngineNodeLauncher`]: reth_node_builder::EngineNodeLauncher
+/// [`ChangesetCache`]: reth_trie_db::ChangesetCache
+#[derive(Debug, Clone)]
+pub struct EngineSharedCaches<Evm: ConfigureEvm> {
+    /// Execution cache handle.
+    execution_cache: PayloadExecutionCache,
+    /// Sparse trie cache handle.
+    sparse_trie_cache: PayloadSparseTrieCache,
+    /// Precompile cache map.
+    precompile_cache_map: PrecompileCacheMap<SpecFor<Evm>>,
+}
+
+impl<Evm: ConfigureEvm> EngineSharedCaches<Evm> {
+    /// Creates a new `EngineSharedCaches` with default caches.
+    pub fn new() -> Self {
+        Self {
+            execution_cache: PayloadExecutionCache::default(),
+            sparse_trie_cache: PayloadSparseTrieCache::default(),
+            precompile_cache_map: PrecompileCacheMap::default(),
+        }
+    }
+
+    /// Returns a clone of the sparse trie cache handle.
+    pub fn sparse_trie_cache(&self) -> PayloadSparseTrieCache {
+        self.sparse_trie_cache.clone()
+    }
+
+    /// Returns a clone of the precompile cache map.
+    pub fn precompile_cache_map(&self) -> PrecompileCacheMap<SpecFor<Evm>> {
+        self.precompile_cache_map.clone()
+    }
+}
+
+impl<Evm: ConfigureEvm> Default for EngineSharedCaches<Evm> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Converts transactions sequentially and sends them to the prewarm and execute channels.
 fn convert_serial<RawTx, Tx, TxEnv, InnerTx, Recovered, Err, C>(
     iter: impl Iterator<Item = RawTx>,
@@ -1175,8 +1226,9 @@ mod tests {
     use super::PayloadExecutionCache;
     use crate::tree::{
         cached_state::{CachedStateMetrics, ExecutionCache, SavedCache},
-        payload_processor::{evm_state_to_hashed_post_state, ExecutionEnv, PayloadProcessor},
-        precompile_cache::PrecompileCacheMap,
+        payload_processor::{
+            evm_state_to_hashed_post_state, EngineSharedCaches, ExecutionEnv, PayloadProcessor,
+        },
         StateProviderBuilder, TreeConfig,
     };
     use alloy_eips::eip1898::{BlockNumHash, BlockWithParent};
@@ -1288,7 +1340,7 @@ mod tests {
             reth_tasks::Runtime::test(),
             EthEvmConfig::new(Arc::new(ChainSpec::default())),
             &TreeConfig::default(),
-            PrecompileCacheMap::default(),
+            EngineSharedCaches::default(),
         );
 
         let parent_hash = B256::from([1u8; 32]);
@@ -1317,7 +1369,7 @@ mod tests {
             reth_tasks::Runtime::test(),
             EthEvmConfig::new(Arc::new(ChainSpec::default())),
             &TreeConfig::default(),
-            PrecompileCacheMap::default(),
+            EngineSharedCaches::default(),
         );
 
         // Setup: populate cache with block 1
@@ -1452,7 +1504,7 @@ mod tests {
             reth_tasks::Runtime::test(),
             EthEvmConfig::new(factory.chain_spec()),
             &TreeConfig::default(),
-            PrecompileCacheMap::default(),
+            EngineSharedCaches::default(),
         );
 
         let provider_factory = BlockchainProvider::new(factory).unwrap();
