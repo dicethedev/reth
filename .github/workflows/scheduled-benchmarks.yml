@@ -31,6 +31,10 @@ on:
 
 name: scheduled benchmarks
 
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   # Determine which benchmark to run based on cron schedule or manual input
   resolve:
@@ -62,11 +66,24 @@ jobs:
           ref: main
           fetch-depth: 0
 
+      # Restore the last-benchmarked SHA for main-regression.
+      # The cache key is stable so we always get the latest saved value.
+      # We save a new cache (with a unique restoreKey suffix) after a
+      # successful benchmark run in the update-state job.
+      - name: Restore main-regression state
+        if: steps.resolve.outputs.benchmark == 'main-regression'
+        id: state-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .bench-state
+          key: bench-main-regression-last-sha
+
       - name: Resolve refs
         id: refs
         uses: actions/github-script@v8
         with:
           script: |
+            const fs = require('fs');
             const { execSync } = require('child_process');
             const run = (cmd) => execSync(cmd, { encoding: 'utf8' }).trim();
             const benchmark = '${{ steps.resolve.outputs.benchmark }}';
@@ -74,14 +91,36 @@ jobs:
             let baseline, feature, skip = 'false';
 
             if (benchmark === 'main-regression') {
-              // Compare the commit before HEAD vs HEAD on main
+              // Baseline = last successfully benchmarked SHA (from cache)
+              // Feature = current main HEAD
+              // Skip if no new commits since last benchmark
               feature = run('git rev-parse HEAD');
+
+              let lastBenchmarkedSha = '';
               try {
-                baseline = run('git rev-parse HEAD~1');
+                lastBenchmarkedSha = fs.readFileSync('.bench-state/last-sha.txt', 'utf8').trim();
+                core.info(`Last benchmarked SHA: ${lastBenchmarkedSha}`);
               } catch {
-                core.info('No previous commit found, skipping');
+                core.info('No previous state found (first run)');
+              }
+
+              if (lastBenchmarkedSha && lastBenchmarkedSha === feature) {
+                core.info('No new commits since last regression check — skipping');
                 skip = 'true';
                 baseline = feature;
+              } else if (lastBenchmarkedSha) {
+                baseline = lastBenchmarkedSha;
+                core.info(`Main regression: baseline=${baseline}, feature=${feature}`);
+              } else {
+                // First run: fall back to parent commit
+                try {
+                  baseline = run('git rev-parse HEAD~1');
+                } catch {
+                  core.info('No parent commit found, skipping');
+                  skip = 'true';
+                  baseline = feature;
+                }
+                core.info(`Main regression (first run): baseline=${baseline}, feature=${feature}`);
               }
 
             } else if (benchmark === 'nightly-regression' || benchmark === 'nightly-regression-bigblocks') {
@@ -168,3 +207,28 @@ jobs:
       baseline: ${{ needs.resolve.outputs.baseline }}
       feature: ${{ needs.resolve.outputs.feature }}
       no_slack: false
+
+  # After a successful main-regression benchmark, persist the feature SHA
+  # so the next run uses it as baseline (tracks last-benchmarked commit).
+  update-main-regression-state:
+    needs: [resolve, main-regression]
+    if: needs.resolve.outputs.benchmark == 'main-regression'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Save last-benchmarked SHA
+        run: |
+          mkdir -p .bench-state
+          echo "${{ needs.resolve.outputs.feature }}" > .bench-state/last-sha.txt
+
+      - name: Delete old cache
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh cache delete bench-main-regression-last-sha \
+            --repo ${{ github.repository }} 2>/dev/null || true
+
+      - uses: actions/cache/save@v4
+        with:
+          path: .bench-state
+          key: bench-main-regression-last-sha
