@@ -196,10 +196,9 @@ impl EngineNodeLauncher {
 
         let shared_caches = EngineSharedCaches::default();
 
-        // Build the engine validator with all required components
         let engine_validator = validator_builder
             .clone()
-            .build_tree_validator_with_caches(
+            .build_tree_validator(
                 &add_ons_ctx,
                 engine_tree_config.clone(),
                 changeset_cache.clone(),
@@ -219,7 +218,7 @@ impl EngineNodeLauncher {
                     let reorg_cache = ChangesetCache::new();
                     let reorg_shared_caches = EngineSharedCaches::default();
                     validator_builder
-                        .build_tree_validator_with_caches(
+                        .build_tree_validator(
                             &add_ons_ctx,
                             engine_tree_config.clone(),
                             reorg_cache,
