@@ -9,12 +9,14 @@ use tracing::debug;
 /// Type alias for the sparse trie type used in preservation.
 pub(super) type SparseTrie = SparseStateTrie<ConfigurableSparseTrie, ConfigurableSparseTrie>;
 
-/// Public handle to the preserved sparse trie cache.
+/// Shared handle to the preserved sparse trie cache.
 ///
-/// This is a lightweight, cloneable handle that provides access to the sparse trie
-/// preserved across payload validations. It is owned by
-/// [`EngineSharedCaches`](super::EngineSharedCaches) and consumed by
-/// [`PayloadProcessor`](super::PayloadProcessor) during construction.
+/// Lightweight, cloneable handle backed by `Arc<Mutex<..>>`. Stored in
+/// [`EngineSharedCaches`](super::EngineSharedCaches) and used directly by
+/// [`PayloadProcessor`](super::PayloadProcessor).
+///
+/// All mutating methods are crate-internal; external consumers only hold the handle
+/// for threading it through the builder path.
 #[derive(Debug, Default, Clone)]
 pub struct PayloadSparseTrieCache(Arc<Mutex<Option<PreservedSparseTrie>>>);
 
@@ -33,11 +35,8 @@ impl PayloadSparseTrieCache {
 
     /// Waits until the sparse trie lock becomes available.
     ///
-    /// This acquires and immediately releases the lock, ensuring that any
-    /// ongoing operations complete before returning. Useful for synchronization
-    /// before starting payload processing.
-    ///
-    /// Returns the time spent waiting for the lock.
+    /// Acquires and immediately releases the lock, ensuring any ongoing operations
+    /// complete before returning. Returns the time spent waiting.
     pub(super) fn wait_for_availability(&self) -> std::time::Duration {
         let start = Instant::now();
         let _guard = self.0.lock();
@@ -50,37 +49,6 @@ impl PayloadSparseTrieCache {
             );
         }
         elapsed
-    }
-}
-
-/// Shared handle to a preserved sparse trie that can be reused across payload validations.
-///
-/// This is stored in [`PayloadProcessor`](super::PayloadProcessor) and cloned to pass to
-/// [`SparseTrieCacheTask`](super::sparse_trie::SparseTrieCacheTask) for trie reuse.
-#[derive(Debug, Default, Clone)]
-pub(super) struct SharedPreservedSparseTrie(PayloadSparseTrieCache);
-
-impl SharedPreservedSparseTrie {
-    /// Creates a new `SharedPreservedSparseTrie` from a [`PayloadSparseTrieCache`].
-    pub(super) fn new(cache: PayloadSparseTrieCache) -> Self {
-        Self(cache)
-    }
-
-    /// Takes the preserved trie if present, leaving `None` in its place.
-    pub(super) fn take(&self) -> Option<PreservedSparseTrie> {
-        self.0.take()
-    }
-
-    /// Acquires a guard that blocks `take()` until dropped.
-    /// Use this before sending the state root result to ensure the next block
-    /// waits for the trie to be stored.
-    pub(super) fn lock(&self) -> PreservedTrieGuard<'_> {
-        self.0.lock()
-    }
-
-    /// Waits until the sparse trie lock becomes available.
-    pub(super) fn wait_for_availability(&self) -> std::time::Duration {
-        self.0.wait_for_availability()
     }
 }
 

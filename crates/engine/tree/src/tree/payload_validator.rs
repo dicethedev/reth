@@ -194,7 +194,7 @@ where
         runtime: reth_tasks::Runtime,
         shared_caches: EngineSharedCaches<Evm>,
     ) -> Self {
-        let precompile_cache_map = shared_caches.precompile_cache_map();
+        let precompile_cache_map = shared_caches.precompile_cache_map.clone();
         let payload_processor =
             PayloadProcessor::new(runtime.clone(), evm_config.clone(), &config, shared_caches);
         Self {

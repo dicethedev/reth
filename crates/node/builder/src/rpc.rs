@@ -1285,30 +1285,34 @@ pub trait EngineValidatorBuilder<Node: FullNodeComponents>: Send + Sync + Clone 
     type EngineValidator: EngineValidator<<Node::Types as NodeTypes>::Payload, <Node::Types as NodeTypes>::Primitives>
         + WaitForCaches;
 
-    /// Builds the tree validator for the consensus engine.
+    /// Builds the tree validator with launcher-owned cache facade.
     ///
-    /// Returns a validator that handles block execution, state validation, and fork handling.
-    fn build_tree_validator(
-        self,
-        ctx: &AddOnsContext<'_, Node>,
-        tree_config: TreeConfig,
-        changeset_cache: ChangesetCache,
-    ) -> impl Future<Output = eyre::Result<Self::EngineValidator>> + Send;
-
-    /// Builds the tree validator with explicit launcher-owned cache facade.
-    ///
-    /// This is the cache-aware entrypoint that receives an [`EngineSharedCaches`] constructed
-    /// by the launcher. The default implementation ignores the shared caches and falls back
-    /// to [`Self::build_tree_validator`].
+    /// This is the primary entrypoint called by the launcher. It receives an
+    /// [`EngineSharedCaches`] so the launcher retains ownership of cache handles.
     fn build_tree_validator_with_caches(
         self,
         ctx: &AddOnsContext<'_, Node>,
         tree_config: TreeConfig,
         changeset_cache: ChangesetCache,
         shared_caches: EngineSharedCaches<Node::Evm>,
+    ) -> impl Future<Output = eyre::Result<Self::EngineValidator>> + Send;
+
+    /// Convenience entrypoint that creates default shared caches.
+    ///
+    /// Delegates to [`Self::build_tree_validator_with_caches`] with
+    /// [`EngineSharedCaches::default()`].
+    fn build_tree_validator(
+        self,
+        ctx: &AddOnsContext<'_, Node>,
+        tree_config: TreeConfig,
+        changeset_cache: ChangesetCache,
     ) -> impl Future<Output = eyre::Result<Self::EngineValidator>> + Send {
-        let _ = shared_caches;
-        self.build_tree_validator(ctx, tree_config, changeset_cache)
+        self.build_tree_validator_with_caches(
+            ctx,
+            tree_config,
+            changeset_cache,
+            EngineSharedCaches::default(),
+        )
     }
 }
 
@@ -1351,21 +1355,6 @@ where
         > + Clone,
 {
     type EngineValidator = BasicEngineValidator<Node::Provider, Node::Evm, EV::Validator>;
-
-    async fn build_tree_validator(
-        self,
-        ctx: &AddOnsContext<'_, Node>,
-        tree_config: TreeConfig,
-        changeset_cache: ChangesetCache,
-    ) -> eyre::Result<Self::EngineValidator> {
-        self.build_tree_validator_with_caches(
-            ctx,
-            tree_config,
-            changeset_cache,
-            EngineSharedCaches::default(),
-        )
-        .await
-    }
 
     async fn build_tree_validator_with_caches(
         self,

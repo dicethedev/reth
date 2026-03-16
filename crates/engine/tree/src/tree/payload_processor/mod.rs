@@ -61,7 +61,7 @@ pub mod receipt_root_task;
 pub mod sparse_trie;
 
 pub use preserved_sparse_trie::PayloadSparseTrieCache;
-use preserved_sparse_trie::{PreservedSparseTrie, SharedPreservedSparseTrie};
+use preserved_sparse_trie::PreservedSparseTrie;
 
 /// Default parallelism thresholds to use with the [`ParallelSparseTrie`].
 ///
@@ -132,7 +132,7 @@ where
     /// A pruned `SparseStateTrie`, kept around as a cache of already revealed trie nodes and to
     /// re-use allocated memory. Stored with the block hash it was computed for to enable trie
     /// preservation across sequential payload validations.
-    sparse_state_trie: SharedPreservedSparseTrie,
+    sparse_state_trie: PayloadSparseTrieCache,
     /// LFU hot-slot capacity: max storage slots retained across prune cycles.
     sparse_trie_max_hot_slots: usize,
     /// LFU hot-account capacity: max account addresses retained across prune cycles.
@@ -156,8 +156,6 @@ where
     }
 
     /// Creates a new payload processor from the launcher-owned [`EngineSharedCaches`].
-    ///
-    /// The facade is destructured here — individual cache handles become private fields.
     pub fn new(
         executor: Runtime,
         evm_config: Evm,
@@ -176,7 +174,7 @@ where
             disable_state_cache: config.disable_state_cache(),
             precompile_cache_disabled: config.precompile_cache_disabled(),
             precompile_cache_map,
-            sparse_state_trie: SharedPreservedSparseTrie::new(sparse_trie_cache),
+            sparse_state_trie: sparse_trie_cache,
             sparse_trie_max_hot_slots: config.sparse_trie_max_hot_slots(),
             sparse_trie_max_hot_accounts: config.sparse_trie_max_hot_accounts(),
             disable_sparse_trie_cache_pruning: config.disable_sparse_trie_cache_pruning(),
@@ -751,47 +749,27 @@ where
 
 /// Launcher-owned facade that groups the caches shared across engine payload processing.
 ///
-/// This type is created once by [`EngineNodeLauncher`] and threaded through the engine validator
-/// build path, following the same ownership pattern as [`ChangesetCache`]. The facade is
-/// destructured by [`PayloadProcessor::new()`] — the individual cache handles become private
-/// fields and internal access sites remain unchanged.
-///
-/// [`EngineNodeLauncher`]: reth_node_builder::EngineNodeLauncher
-/// [`ChangesetCache`]: reth_trie_db::ChangesetCache
-#[derive(Debug, Clone)]
+/// Created once by the node launcher and threaded through the engine validator build path,
+/// following the same ownership pattern as `ChangesetCache`. The facade is destructured by
+/// [`PayloadProcessor::new()`] -- the individual cache handles become private fields and
+/// internal access sites remain unchanged.
+#[derive(Debug)]
 pub struct EngineSharedCaches<Evm: ConfigureEvm> {
     /// Execution cache handle.
-    execution_cache: PayloadExecutionCache,
+    pub execution_cache: PayloadExecutionCache,
     /// Sparse trie cache handle.
-    sparse_trie_cache: PayloadSparseTrieCache,
+    pub sparse_trie_cache: PayloadSparseTrieCache,
     /// Precompile cache map.
-    precompile_cache_map: PrecompileCacheMap<SpecFor<Evm>>,
+    pub precompile_cache_map: PrecompileCacheMap<SpecFor<Evm>>,
 }
 
-impl<Evm: ConfigureEvm> EngineSharedCaches<Evm> {
-    /// Creates a new `EngineSharedCaches` with default caches.
-    pub fn new() -> Self {
+impl<Evm: ConfigureEvm> Default for EngineSharedCaches<Evm> {
+    fn default() -> Self {
         Self {
             execution_cache: PayloadExecutionCache::default(),
             sparse_trie_cache: PayloadSparseTrieCache::default(),
             precompile_cache_map: PrecompileCacheMap::default(),
         }
-    }
-
-    /// Returns a clone of the sparse trie cache handle.
-    pub fn sparse_trie_cache(&self) -> PayloadSparseTrieCache {
-        self.sparse_trie_cache.clone()
-    }
-
-    /// Returns a clone of the precompile cache map.
-    pub fn precompile_cache_map(&self) -> PrecompileCacheMap<SpecFor<Evm>> {
-        self.precompile_cache_map.clone()
-    }
-}
-
-impl<Evm: ConfigureEvm> Default for EngineSharedCaches<Evm> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

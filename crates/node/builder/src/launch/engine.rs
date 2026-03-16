@@ -195,7 +195,7 @@ impl EngineNodeLauncher {
         let validator_builder = add_ons.engine_validator_builder();
 
         // Create launcher-owned engine shared caches (following ChangesetCache pattern)
-        let shared_caches = EngineSharedCaches::new();
+        let shared_caches = EngineSharedCaches::default();
 
         // Build the engine validator with all required components
         let engine_validator = validator_builder
@@ -218,7 +218,7 @@ impl EngineNodeLauncher {
                 || async {
                     // Create separate caches for reorg validator (not shared with main engine)
                     let reorg_cache = ChangesetCache::new();
-                    let reorg_shared_caches = EngineSharedCaches::new();
+                    let reorg_shared_caches = EngineSharedCaches::default();
                     validator_builder
                         .build_tree_validator_with_caches(
                             &add_ons_ctx,
