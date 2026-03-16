@@ -1,11 +1,9 @@
-use super::{
-    branch_child_idx::{BranchChildIdx, BranchChildIter},
-    ArenaSparseSubtrie, Index, NodeArena,
-};
+use super::{ArenaSparseSubtrie, Index, NodeArena};
 use alloc::{boxed::Box, vec::Vec};
 use alloy_primitives::{keccak256, B256};
 use alloy_trie::{BranchNodeCompact, TrieMask};
 use reth_trie_common::{BranchNodeMasks, Nibbles, ProofTrieNodeV2, RlpNode, TrieNodeV2};
+use slotmap::Key as _;
 use smallvec::SmallVec;
 
 /// Tracks whether a node's RLP encoding is cached or needs recomputation.
@@ -37,11 +35,26 @@ impl ArenaSparseNodeState {
     }
 }
 
+/// Creates the null index sentinel used for empty slots in the branch children array.
+///
+/// `DefaultKey::null()` is not const, so we call it at runtime.
+fn null_index() -> Index {
+    Index::null()
+}
+
+/// Creates a `[Index; 16]` array filled with null indices.
+pub(super) fn null_children() -> [Index; 16] {
+    [null_index(); 16]
+}
+
 /// Hot branch data — only fields needed for traversal (seek/next).
 ///
-/// Revealed children are stored densely in a `SmallVec` with [`BranchChildIdx`] mapping
-/// nibbles to dense indices via `revealed_mask`.
+/// Layout uses `#[repr(C)]` to ensure `state_mask`, `revealed_mask`, and `short_key` are
+/// placed **before** the 128-byte `children` array. This keeps the seek-hot fields (masks +
+/// short_key) in the same cache line as the enum discriminant, so a single node fetch during
+/// `seek` only needs 1 guaranteed L3 miss instead of 2.
 #[derive(Debug, Clone)]
+#[repr(C)]
 pub(super) struct ArenaBranchHot {
     /// Bitmask indicating which of the 16 child slots are occupied.
     pub(super) state_mask: TrieMask,
@@ -50,16 +63,19 @@ pub(super) struct ArenaBranchHot {
     pub(super) revealed_mask: TrieMask,
     /// The short key (extension key) for this branch.
     pub(super) short_key: Nibbles,
-    /// Revealed children stored densely in nibble order. The dense index for a given nibble
-    /// is computed via `BranchChildIdx::new(revealed_mask, nibble)`.
-    pub(super) children: SmallVec<[Index; 4]>,
+    /// Direct nibble-indexed child array. `children[nibble]` is valid when
+    /// `revealed_mask.is_bit_set(nibble)` is true. Unused slots contain null indices.
+    pub(super) children: [Index; 16],
 }
 
 impl ArenaBranchHot {
     /// Returns the revealed child index at `nibble`, or `None` if the child is not revealed.
     pub(super) fn revealed_child(&self, nibble: u8) -> Option<Index> {
-        BranchChildIdx::new(self.revealed_mask, nibble)
-            .map(|idx| self.children[idx])
+        if self.revealed_mask.is_bit_set(nibble) {
+            Some(self.children[nibble as usize])
+        } else {
+            None
+        }
     }
 
     /// Returns `true` if the child at `nibble` is blinded (occupied but not revealed).
@@ -91,25 +107,21 @@ impl ArenaBranchHot {
 
     /// Iterates over `(nibble, child_index)` pairs for revealed children in nibble order.
     pub(super) fn revealed_iter(&self) -> impl Iterator<Item = (u8, Index)> + '_ {
-        BranchChildIter::new(self.revealed_mask)
-            .map(|(idx, nibble)| (nibble, self.children[idx]))
+        self.revealed_mask.iter().map(|nibble| (nibble, self.children[nibble as usize]))
     }
 
     /// Sets a child as revealed at `nibble`.
     pub(super) fn set_revealed_child(&mut self, nibble: u8, child_idx: Index) {
         self.state_mask.set_bit(nibble);
-        let insert_pos = BranchChildIdx::insertion_point(self.revealed_mask, nibble);
         self.revealed_mask.set_bit(nibble);
-        self.children.insert(insert_pos.get(), child_idx);
+        self.children[nibble as usize] = child_idx;
     }
 
     /// Removes a child at `nibble`, clearing it from both masks.
     pub(super) fn remove_child(&mut self, nibble: u8) {
-        if let Some(idx) = BranchChildIdx::new(self.revealed_mask, nibble) {
-            self.children.remove(idx.get());
-            self.revealed_mask.unset_bit(nibble);
-        }
         self.state_mask.unset_bit(nibble);
+        self.revealed_mask.unset_bit(nibble);
+        self.children[nibble as usize] = null_index();
     }
 }
 
@@ -325,8 +337,8 @@ impl NodeArena {
         let mut hashes = Vec::new();
         for nibble in hot.state_mask.iter() {
             if cold.branch_masks.hash_mask.is_bit_set(nibble) {
-                let hash = if let Some(child_idx) = hot.revealed_child(nibble) {
-                    self.cached_hash(child_idx)
+                let hash = if hot.revealed_mask.is_bit_set(nibble) {
+                    self.cached_hash(hot.children[nibble as usize])
                 } else {
                     let blinded_idx = blinded_dense_index(hot, nibble);
                     cold.blinded[blinded_idx]
@@ -352,7 +364,8 @@ impl NodeArena {
         let mut masks = BranchNodeMasks::default();
 
         for nibble in hot.state_mask.iter() {
-            let (hash_bit, tree_bit) = if let Some(child_idx) = hot.revealed_child(nibble) {
+            let (hash_bit, tree_bit) = if hot.revealed_mask.is_bit_set(nibble) {
+                let child_idx = hot.children[nibble as usize];
                 (self.hash_mask_bit(child_idx), self.tree_mask_bit(child_idx))
             } else {
                 (
@@ -408,10 +421,8 @@ impl NodeArena {
             hot.revealed_mask.is_bit_set(nibble),
             "blind_child: nibble is not revealed"
         );
-        let revealed_idx = BranchChildIdx::new(hot.revealed_mask, nibble)
-            .expect("nibble is revealed");
-        hot.children.remove(revealed_idx.get());
         hot.revealed_mask.unset_bit(nibble);
+        hot.children[nibble as usize] = null_index();
         // Insert into blinded dense array at the correct position.
         let dense = blinded_dense_index(&self[idx].branch_ref(), nibble);
         self.cold_mut(idx).branch_mut().blinded.insert(dense, rlp);
@@ -438,6 +449,7 @@ pub(super) fn from_proof_node(
             }),
         ),
         TrieNodeV2::Branch(branch) => {
+            let children = null_children();
             let blinded: SmallVec<[RlpNode; 4]> = branch.stack
                 [..branch.state_mask.count_bits() as usize]
                 .iter()
@@ -448,7 +460,7 @@ pub(super) fn from_proof_node(
                     state_mask: branch.state_mask,
                     revealed_mask: TrieMask::default(),
                     short_key: branch.key,
-                    children: SmallVec::new(),
+                    children,
                 }),
                 Some(ArenaSparseNodeCold::Branch(ArenaBranchCold {
                     state: ArenaSparseNodeState::Revealed,

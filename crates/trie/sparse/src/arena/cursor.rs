@@ -1,7 +1,4 @@
-use super::{
-    branch_child_idx::BranchChildIdx,
-    ArenaSparseNode, ArenaSparseNodeState, Index, NodeArena,
-};
+use super::{ArenaSparseNode, ArenaSparseNodeState, Index, NodeArena};
 use alloc::vec::Vec;
 use reth_trie_common::Nibbles;
 use tracing::{instrument, trace};
@@ -210,15 +207,14 @@ impl ArenaCursor {
             child_nibble.expect("if cursor has a parent then the head path can't be empty");
 
         let parent_branch = arena[parent.index].branch_mut();
-        let child_idx = BranchChildIdx::new(parent_branch.revealed_mask, child_nibble)
-            .expect("child nibble not found in parent revealed_mask");
 
-        debug_assert_eq!(
-            parent_branch.children[child_idx], old_idx,
+        debug_assert!(
+            parent_branch.revealed_mask.is_bit_set(child_nibble) &&
+                parent_branch.children[child_nibble as usize] == old_idx,
             "parent child at nibble {child_nibble} does not match old_idx",
         );
 
-        parent_branch.children[child_idx] = new_idx;
+        parent_branch.children[child_nibble as usize] = new_idx;
     }
 
     /// Advances the DFS traversal to the next actionable node.
@@ -260,10 +256,12 @@ impl ArenaCursor {
 
             let mut descended = false;
             // Iterate over revealed children starting from resume_nibble.
-            for (nibble, child_idx) in branch.revealed_iter() {
+            for nibble in branch.revealed_mask.iter() {
                 if nibble < resume_nibble {
                     continue;
                 }
+
+                let child_idx = branch.children[nibble as usize];
 
                 if should_descend(arena, child_idx) {
                     // Record where to resume iteration when we return to this entry.
@@ -351,8 +349,7 @@ impl ArenaCursor {
                     }
 
                     // Child is revealed — push and continue descent.
-                    let child_idx = branch.revealed_child(child_nibble)
-                        .expect("child is revealed");
+                    let child_idx = branch.children[child_nibble as usize];
                     let mut child_path = head_path;
                     child_path.extend(short_key);
                     child_path.push_unchecked(child_nibble);

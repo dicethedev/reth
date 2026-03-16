@@ -870,9 +870,9 @@ impl ArenaParallelSparseTrie {
 
         // Migrate any revealed children from the upper arena into the subtrie arena.
         if let ArenaSparseNode::Branch(b) = &mut root_node {
-            for idx in 0..b.children.len() {
-                let old_idx = b.children[idx];
-                b.children[idx] =
+            for nibble in b.revealed_mask.iter().collect::<SmallVec<[u8; 16]>>() {
+                let old_idx = b.children[nibble as usize];
+                b.children[nibble as usize] =
                     Self::migrate_nodes(&mut subtrie.arena, &mut self.upper_arena, old_idx, None);
             }
         }
@@ -1209,8 +1209,10 @@ impl ArenaParallelSparseTrie {
 
             rlp_node_buf.clear();
             let state_mask = arena[head_idx].branch_ref().state_mask;
+            let revealed_mask = arena[head_idx].branch_ref().revealed_mask;
             for nibble in state_mask.iter() {
-                if let Some(child_idx) = arena[head_idx].branch_ref().revealed_child(nibble) {
+                if revealed_mask.is_bit_set(nibble) {
+                    let child_idx = arena[head_idx].branch_ref().children[nibble as usize];
                     match &arena[child_idx] {
                         ArenaSparseNode::Leaf { .. } => {
                             Self::encode_leaf(arena, child_idx, rlp_buf, rlp_node_buf);
@@ -1536,7 +1538,9 @@ impl ArenaParallelSparseTrie {
 
         let state_mask = TrieMask::from(1u16 << first_nibble | 1u16 << second_nibble);
         let revealed_mask = state_mask;
-        let children: SmallVec<[Index; 4]> = smallvec::smallvec![first_child, second_child];
+        let mut children = nodes::null_children();
+        children[first_nibble as usize] = first_child;
+        children[second_nibble as usize] = second_child;
 
         let new_branch_idx = arena.insert(
             ArenaSparseNode::Branch(ArenaBranchHot {
@@ -2049,9 +2053,9 @@ impl ArenaParallelSparseTrie {
 
         // Recursively migrate children first so their new indices are known.
         if let ArenaSparseNode::Branch(b) = &mut node {
-            for idx in 0..b.children.len() {
-                let old_idx = b.children[idx];
-                b.children[idx] = Self::migrate_nodes(dst, src, old_idx, None);
+            for nibble in b.revealed_mask.iter().collect::<SmallVec<[u8; 16]>>() {
+                let old_idx = b.children[nibble as usize];
+                b.children[nibble as usize] = Self::migrate_nodes(dst, src, old_idx, None);
             }
         }
 
@@ -2285,7 +2289,7 @@ impl SparseTrie for ArenaParallelSparseTrie {
                     state_mask: branch.state_mask,
                     revealed_mask: TrieMask::default(),
                     short_key: branch.key,
-                    children: SmallVec::new(),
+                    children: nodes::null_children(),
                 });
                 self.upper_arena.cold.insert(self.root, ArenaSparseNodeCold::Branch(ArenaBranchCold {
                     state: ArenaSparseNodeState::Revealed,
