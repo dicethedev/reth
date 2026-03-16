@@ -18,6 +18,7 @@ mod new_payload_only;
 mod output;
 mod persistence_waiter;
 mod replay_payloads;
+mod replay_reorg;
 mod send_invalid_payload;
 mod send_payload;
 
@@ -89,6 +90,19 @@ pub enum Subcommands {
     /// `cast block latest --full --json | reth-bench send-invalid-payload --rpc-url localhost:5000
     /// --jwt-secret $(cat ~/.local/share/reth/mainnet/jwt.hex) --invalid-state-root`
     SendInvalidPayload(Box<send_invalid_payload::Command>),
+
+    /// Replay a reorg between two existing block hashes.
+    ///
+    /// Discovers the common ancestor of two competing chain tips, builds one fork as
+    /// canonical, imports the competing fork, and then triggers a reorg via
+    /// `forkchoiceUpdated`.
+    ///
+    /// Example:
+    ///
+    /// `reth-bench replay-reorg --rpc-url http://localhost:8545 --engine-rpc-url
+    /// http://localhost:8551 --jwt-secret ~/.local/share/reth/mainnet/jwt.hex
+    /// --tip-a 0xaaa... --tip-b 0xbbb...`
+    ReplayReorg(replay_reorg::Command),
 }
 
 impl BenchmarkCommand {
@@ -105,6 +119,7 @@ impl BenchmarkCommand {
             Subcommands::GenerateBigBlock(command) => command.execute(ctx).await,
             Subcommands::ReplayPayloads(command) => command.execute(ctx).await,
             Subcommands::SendInvalidPayload(command) => (*command).execute(ctx).await,
+            Subcommands::ReplayReorg(command) => command.execute(ctx).await,
         }
     }
 
