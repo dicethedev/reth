@@ -60,8 +60,8 @@ pub mod prewarm;
 pub mod receipt_root_task;
 pub mod sparse_trie;
 
-pub use preserved_sparse_trie::SharedPreservedSparseTrie;
 use preserved_sparse_trie::PreservedSparseTrie;
+pub use preserved_sparse_trie::SharedPreservedSparseTrie;
 
 /// Default parallelism thresholds to use with the [`ParallelSparseTrie`].
 ///
