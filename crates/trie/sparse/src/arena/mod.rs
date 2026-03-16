@@ -456,9 +456,9 @@ pub struct ArenaParallelismThresholds {
     /// reveal. Subtries with fewer nodes to reveal than this are revealed inline during the
     /// upper trie walk.
     pub min_revealed_nodes: usize,
-    /// Minimum number of leaf updates targeting a subtrie before it is eligible for parallel
-    /// update. Subtries with fewer updates than this are updated inline during the upper trie
-    /// walk.
+    /// Minimum total number of leaf updates across all subtries before they are processed in
+    /// parallel. When the total update count is below this threshold, all subtries are updated
+    /// serially.
     pub min_updates: usize,
     /// Minimum number of revealed leaves in a subtrie before it is eligible for parallel
     /// pruning. Subtries with fewer leaves than this are pruned inline during the upper trie
@@ -471,7 +471,7 @@ impl Default for ArenaParallelismThresholds {
         Self {
             min_dirty_leaves: 64,
             min_revealed_nodes: 16,
-            min_updates: 128,
+            min_updates: 64,
             min_leaves_for_prune: 128,
         }
     }
@@ -508,7 +508,7 @@ impl Default for ArenaParallelismThresholds {
 ///
 /// Leaf updates and removals are applied via [`SparseTrie::update_leaves`]. The method walks
 /// the upper trie to route each update to the correct subtrie, then processes subtries in
-/// parallel when the update count exceeds [`ArenaParallelismThresholds::min_updates`].
+/// parallel when the total update count exceeds [`ArenaParallelismThresholds::min_updates`].
 ///
 /// [`SparseTrie::update_leaf`] and [`SparseTrie::remove_leaf`] are not yet implemented.
 ///
@@ -2914,13 +2914,12 @@ impl SparseTrie for ArenaParallelSparseTrie {
             updates.drain().map(|(key, update)| (key, Nibbles::unpack(key), update)).collect();
         sorted.sort_unstable_by_key(|entry| entry.1);
 
-        let threshold = self.parallelism_thresholds.min_updates;
-
         let mut cursor = mem::take(&mut self.buffers.cursor);
         cursor.reset(&self.upper_arena, self.root, Nibbles::default());
 
-        // Subtries taken for parallel processing: (arena_index, subtrie, update_range).
+        // Subtries taken for batch processing: (arena_index, subtrie, update_range).
         let mut taken: Vec<(Index, Box<ArenaSparseSubtrie>, core::ops::Range<usize>)> = Vec::new();
+        let mut total_subtrie_updates: usize = 0;
 
         let mut update_idx = 0;
         while update_idx < sorted.len() {
@@ -2994,19 +2993,10 @@ impl SparseTrie for ArenaParallelSparseTrie {
                         }
                     };
 
-                    if num_subtrie_updates >= threshold && !force_inline {
-                        // Take subtrie for parallel update.
-                        trace!(target: TRACE_TARGET, ?subtrie_root_path, num_subtrie_updates, "Taking subtrie for parallel update");
-                        let ArenaSparseNode::Subtrie(subtrie) = mem::replace(
-                            &mut self.upper_arena[child_idx],
-                            ArenaSparseNode::TakenSubtrie,
-                        ) else {
-                            unreachable!()
-                        };
-                        taken.push((child_idx, subtrie, subtrie_start..update_idx));
-                    } else {
-                        // Update inline.
-                        trace!(target: TRACE_TARGET, ?subtrie_root_path, num_subtrie_updates, "Updating subtrie inline");
+                    if force_inline {
+                        // Update inline — subtrie could be emptied and must be
+                        // handled immediately to avoid parallel collapse conflicts.
+                        trace!(target: TRACE_TARGET, ?subtrie_root_path, num_subtrie_updates, "Updating subtrie inline (force)");
                         let ArenaSparseNode::Subtrie(subtrie) = &mut self.upper_arena[child_idx]
                         else {
                             unreachable!()
@@ -3024,6 +3014,18 @@ impl SparseTrie for ArenaParallelSparseTrie {
 
                         // Check if the subtrie's root became empty after updates.
                         self.maybe_unwrap_subtrie(&mut cursor);
+                    } else {
+                        // Take the subtrie for batch processing. The decision to use
+                        // parallelism is made after the walk based on total update count.
+                        trace!(target: TRACE_TARGET, ?subtrie_root_path, num_subtrie_updates, "Taking subtrie for batch update");
+                        let ArenaSparseNode::Subtrie(subtrie) = mem::replace(
+                            &mut self.upper_arena[child_idx],
+                            ArenaSparseNode::TakenSubtrie,
+                        ) else {
+                            unreachable!()
+                        };
+                        taken.push((child_idx, subtrie, subtrie_start..update_idx));
+                        total_subtrie_updates += num_subtrie_updates;
                     }
 
                     // Don't increment update_idx — already advanced past subtrie updates.
@@ -3125,16 +3127,18 @@ impl SparseTrie for ArenaParallelSparseTrie {
             return Ok(());
         }
 
-        // Apply updates to taken subtries, in parallel if more than one.
-        if taken.len() == 1 {
-            let (_, ref mut subtrie, ref range) = taken[0];
-            subtrie.update_leaves(&sorted[range.clone()]);
-        } else {
+        // Apply updates to taken subtries: in parallel if total updates meet the
+        // threshold and there is more than one subtrie, otherwise serially.
+        if taken.len() > 1 && total_subtrie_updates >= self.parallelism_thresholds.min_updates {
             use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
 
             taken.par_iter_mut().for_each(|(_, subtrie, range)| {
                 subtrie.update_leaves(&sorted[range.clone()]);
             });
+        } else {
+            for &mut (_, ref mut subtrie, ref range) in &mut taken {
+                subtrie.update_leaves(&sorted[range.clone()]);
+            }
         }
 
         // Collect subtrie paths before consuming `taken`, then restore subtries and
@@ -3174,7 +3178,7 @@ impl SparseTrie for ArenaParallelSparseTrie {
                         cursor.pop(&mut self.upper_arena);
 
                         // The parent branch (now at cursor top) may have had a sibling
-                        // removed during inline processing while this subtrie was taken.
+                        // removed during batch processing while this subtrie was taken.
                         // Handle any necessary collapse or removal.
                         self.maybe_collapse_or_remove_branch(&mut cursor);
                     }
