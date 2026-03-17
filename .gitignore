@@ -30,6 +30,10 @@ data/
 # Proptest data
 proptest-regressions/
 
+# Cargo-fuzz corpus and artifacts
+**/fuzz/corpus/
+**/fuzz/artifacts/
+
 # Release artifacts
 dist/
 

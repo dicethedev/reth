@@ -1,0 +1,30 @@
+[package]
+name = "reth-trie-sparse-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1.3", features = ["derive"] }
+
+reth-trie-sparse = { path = "..", features = ["std", "test-utils", "arbitrary"] }
+reth-trie = { path = "../../trie", features = ["test-utils"] }
+reth-trie-common = { path = "../../common", features = ["test-utils", "arbitrary"] }
+
+alloy-primitives = { version = "1.5", default-features = false, features = ["std", "map-foldhash"] }
+alloy-rlp = { version = "0.3", default-features = false, features = ["std"] }
+
+rand = "0.9"
+
+[[bin]]
+name = "swarm_sparse_trie"
+path = "fuzz_targets/swarm_sparse_trie.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
