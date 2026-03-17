@@ -141,13 +141,13 @@ if [ -n "${BENCH_METRICS_ADDR:-}" ]; then
   RETH_ARGS+=(--metrics "$BENCH_METRICS_ADDR")
 fi
 
-# OTLP traces and logs export
-if [ -n "${BENCH_OTLP_TRACES_ENDPOINT:-}" ]; then
-  RETH_ARGS+=(--tracing-otlp="${BENCH_OTLP_TRACES_ENDPOINT}" --tracing-otlp.service-name=reth-bench)
-fi
-if [ -n "${BENCH_OTLP_LOGS_ENDPOINT:-}" ]; then
-  RETH_ARGS+=(--logs-otlp="${BENCH_OTLP_LOGS_ENDPOINT}" --logs-otlp.filter=debug)
-fi
+# OTLP traces and logs export (disabled for spike investigation)
+# if [ -n "${BENCH_OTLP_TRACES_ENDPOINT:-}" ]; then
+#   RETH_ARGS+=(--tracing-otlp="${BENCH_OTLP_TRACES_ENDPOINT}" --tracing-otlp.service-name=reth-bench)
+# fi
+# if [ -n "${BENCH_OTLP_LOGS_ENDPOINT:-}" ]; then
+#   RETH_ARGS+=(--logs-otlp="${BENCH_OTLP_LOGS_ENDPOINT}" --logs-otlp.filter=debug)
+# fi
 
 # Tracy profiling: add --log.tracy flags and set environment
 if [ "${BENCH_TRACY:-off}" != "off" ]; then
@@ -160,10 +160,11 @@ if [ "${BENCH_TRACY:-off}" != "off" ]; then
 fi
 
 SUDO_ENV=()
-if [ -n "${OTEL_RESOURCE_ATTRIBUTES:-}" ]; then
-  SUDO_ENV+=("OTEL_RESOURCE_ATTRIBUTES=${OTEL_RESOURCE_ATTRIBUTES}")
-  SUDO_ENV+=("OTEL_BSP_MAX_QUEUE_SIZE=65536" "OTEL_BLRP_MAX_QUEUE_SIZE=65536")
-fi
+# OTEL env disabled for spike investigation
+# if [ -n "${OTEL_RESOURCE_ATTRIBUTES:-}" ]; then
+#   SUDO_ENV+=("OTEL_RESOURCE_ATTRIBUTES=${OTEL_RESOURCE_ATTRIBUTES}")
+#   SUDO_ENV+=("OTEL_BSP_MAX_QUEUE_SIZE=65536" "OTEL_BLRP_MAX_QUEUE_SIZE=65536")
+# fi
 
 # Limit reth memory to 95% of available RAM to prevent OOM kills
 TOTAL_MEM_KB=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
