@@ -137,9 +137,10 @@ if [ -n "$EXTRA_NODE_ARGS" ]; then
   RETH_ARGS+=($EXTRA_NODE_ARGS)
 fi
 
-if [ -n "${BENCH_METRICS_ADDR:-}" ]; then
-  RETH_ARGS+=(--metrics "$BENCH_METRICS_ADDR")
-fi
+# Metrics disabled for spike investigation
+# if [ -n "${BENCH_METRICS_ADDR:-}" ]; then
+#   RETH_ARGS+=(--metrics "$BENCH_METRICS_ADDR")
+# fi
 
 # OTLP traces and logs export
 if [ -n "${BENCH_OTLP_TRACES_ENDPOINT:-}" ]; then
