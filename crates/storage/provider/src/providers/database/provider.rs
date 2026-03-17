@@ -14,11 +14,11 @@ use crate::{
     BlockReader, BlockWriter, BundleStateInit, ChainStateBlockReader, ChainStateBlockWriter,
     DBProvider, EitherReader, EitherWriter, EitherWriterDestination, HashingWriter, HeaderProvider,
     HeaderSyncGapProvider, HistoricalStateProvider, HistoricalStateProviderRef, HistoryWriter,
-    LatestStateProviderRef, OriginalValuesKnown, ProviderError, PruneCheckpointReader,
-    PruneCheckpointWriter, RawRocksDBBatch, RevertsInit, RocksBatchArg, RocksDBProviderFactory,
-    StageCheckpointReader, StateProviderBox, StateWriter, StaticFileProviderFactory, StatsReader,
-    StorageReader, StorageTrieWriter, TransactionVariant, TransactionsProvider,
-    TransactionsProviderExt, TrieWriter,
+    LatestStateProvider, LatestStateProviderRef, OriginalValuesKnown, ProviderError,
+    PruneCheckpointReader, PruneCheckpointWriter, RawRocksDBBatch, RevertsInit, RocksBatchArg,
+    RocksDBProviderFactory, StageCheckpointReader, StateProviderBox, StateWriter,
+    StaticFileProviderFactory, StatsReader, StorageReader, StorageTrieWriter, TransactionVariant,
+    TransactionsProvider, TransactionsProviderExt, TrieWriter,
 };
 use alloy_consensus::{
     transaction::{SignerRecoverable, TransactionMeta, TxHashRef},
@@ -871,13 +871,25 @@ impl<TX: DbTx + 'static, N: NodeTypes> TryIntoHistoricalStateProvider for Databa
             });
         }
 
-        // Note: we intentionally do NOT short-circuit with `LatestStateProvider` when
-        // `block_number == best_block`. `best_block` is the `StageId::Finish` checkpoint, but
-        // during pipeline sync the Execution stage may have already committed state changes for
-        // later blocks, advancing the plain/hashed state tables past `best_block`.
-        // `LatestStateProvider` reads those tables directly and would return state from the
-        // execution frontier instead of the requested block. `HistoricalStateProvider` correctly
-        // reconstructs state via changesets regardless of where plain state currently sits.
+        if block_number == best_block {
+            // Check whether the Execution stage has committed past the Finish checkpoint.
+            // If so, plain state is ahead and neither `LatestStateProvider` (reads plain state
+            // directly) nor `HistoricalStateProvider` (falls back to `InPlainState` for keys
+            // without indexed modifications after the target) can safely serve this block.
+            let execution_tip = self
+                .get_stage_checkpoint(StageId::Execution)?
+                .map(|c| c.block_number)
+                .unwrap_or_default();
+
+            if execution_tip > best_block {
+                return Err(ProviderError::BlockNotExecuted {
+                    requested: block_number,
+                    executed: best_block,
+                });
+            }
+
+            return Ok(Box::new(LatestStateProvider::new(self)));
+        }
 
         // +1 as the changeset that we want is the one that was applied after this block.
         block_number += 1;
