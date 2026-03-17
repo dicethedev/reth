@@ -89,10 +89,6 @@ on:
         required: false
         default: ""
         type: string
-      wait_time:
-        required: false
-        default: ""
-        type: string
       baseline_args:
         required: false
         default: ""
@@ -109,10 +105,6 @@ on:
         required: false
         default: true
         type: boolean
-      cores:
-        required: false
-        default: "0"
-        type: string
       no_slack:
         required: false
         default: false
