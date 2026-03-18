@@ -115,7 +115,7 @@ for i in $(seq 1 300); do
   SYNCING=$(curl -sf http://127.0.0.1:8545 -X POST \
     -H 'Content-Type: application/json' \
     -d '{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}' 2>/dev/null \
-    | jq -r '.result' 2>/dev/null)
+    | jq -r '.result' 2>/dev/null) || true
   if [ "$SYNCING" = "false" ]; then
     echo "reth finished syncing after ${i}s"
     break
