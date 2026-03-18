@@ -1,10 +1,13 @@
-use alloy_primitives::{BlockNumber, B256};
+use alloy_primitives::{BlockNumber, B256, U256};
 use metrics::{Counter, Histogram};
 use reth_chain_state::LazyOverlay;
 use reth_db_api::{tables, transaction::DbTx, DatabaseError};
 use reth_errors::{ProviderError, ProviderResult};
 use reth_metrics::Metrics;
-use reth_primitives_traits::dashmap::{self, DashMap};
+use reth_primitives_traits::{
+    dashmap::{self, DashMap},
+    Account,
+};
 use reth_prune_types::PruneSegment;
 use reth_stages_types::StageId;
 use reth_storage_api::{
@@ -13,7 +16,9 @@ use reth_storage_api::{
     StorageChangeSetReader, StorageSettingsCache,
 };
 use reth_trie::{
-    hashed_cursor::{HashedCursorFactory, HashedPostStateCursorFactory},
+    hashed_cursor::{
+        HashedCursor, HashedCursorFactory, HashedPostStateCursorFactory, HashedStorageCursor,
+    },
     trie_cursor::{InMemoryTrieCursor, TrieCursor, TrieCursorFactory, TrieStorageCursor},
     updates::TrieUpdatesSorted,
     HashedPostStateSorted,
@@ -511,12 +516,12 @@ where
     Provider::Tx: DbTx,
 {
     type AccountTrieCursor<'a>
-        = InMemoryTrieCursor<'a, Box<dyn TrieCursor + Send + 'a>>
+        = Box<dyn TrieCursor + Send + 'a>
     where
         Self: 'a;
 
     type StorageTrieCursor<'a>
-        = InMemoryTrieCursor<'a, Box<dyn TrieStorageCursor + Send + 'a>>
+        = Box<dyn TrieStorageCursor + Send + 'a>
     where
         Self: 'a;
 
@@ -532,7 +537,7 @@ where
                 tx.cursor_read::<tables::AccountsTrie>()?,
             ))
         };
-        Ok(InMemoryTrieCursor::new_account(cursor, trie_updates))
+        Ok(Box::new(InMemoryTrieCursor::new_account(cursor, trie_updates)))
     }
 
     fn storage_trie_cursor(
@@ -552,7 +557,7 @@ where
                 hashed_address,
             ))
         };
-        Ok(InMemoryTrieCursor::new_storage(cursor, trie_updates, hashed_address))
+        Ok(Box::new(InMemoryTrieCursor::new_storage(cursor, trie_updates, hashed_address)))
     }
 }
 
@@ -561,18 +566,12 @@ where
     Provider: DBProvider,
 {
     type AccountCursor<'a>
-        = <HashedPostStateCursorFactory<
-        DatabaseHashedCursorFactory<&'a Provider::Tx>,
-        &'a Arc<HashedPostStateSorted>,
-    > as HashedCursorFactory>::AccountCursor<'a>
+        = Box<dyn HashedCursor<Value = Account> + Send + 'a>
     where
         Self: 'a;
 
     type StorageCursor<'a>
-        = <HashedPostStateCursorFactory<
-        DatabaseHashedCursorFactory<&'a Provider::Tx>,
-        &'a Arc<HashedPostStateSorted>,
-    > as HashedCursorFactory>::StorageCursor<'a>
+        = Box<dyn HashedStorageCursor<Value = U256> + Send + 'a>
     where
         Self: 'a;
 
@@ -580,7 +579,7 @@ where
         let db_hashed_cursor_factory = DatabaseHashedCursorFactory::new(self.provider.tx_ref());
         let hashed_cursor_factory =
             HashedPostStateCursorFactory::new(db_hashed_cursor_factory, &self.hashed_post_state);
-        hashed_cursor_factory.hashed_account_cursor()
+        Ok(Box::new(hashed_cursor_factory.hashed_account_cursor()?))
     }
 
     fn hashed_storage_cursor(
@@ -590,6 +589,6 @@ where
         let db_hashed_cursor_factory = DatabaseHashedCursorFactory::new(self.provider.tx_ref());
         let hashed_cursor_factory =
             HashedPostStateCursorFactory::new(db_hashed_cursor_factory, &self.hashed_post_state);
-        hashed_cursor_factory.hashed_storage_cursor(hashed_address)
+        Ok(Box::new(hashed_cursor_factory.hashed_storage_cursor(hashed_address)?))
     }
 }
