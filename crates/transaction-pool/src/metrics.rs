@@ -62,6 +62,8 @@ pub struct TxPoolMetrics {
     pub blob_transactions_evicted: Counter,
     /// Counter for the number of queued transactions evicted
     pub queued_transactions_evicted: Counter,
+    /// The max priority fee per gas of the most recently inserted pending transaction
+    pub pending_tx_max_priority_fee_per_gas: Gauge,
 }
 
 /// Transaction pool blobstore metrics

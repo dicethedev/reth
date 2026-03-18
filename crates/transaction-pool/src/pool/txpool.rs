@@ -806,6 +806,9 @@ impl<T: TransactionOrdering> TxPool<T> {
 
                 // This transaction was moved to the pending pool.
                 let res = if move_to.is_pending() {
+                    self.metrics
+                        .pending_tx_max_priority_fee_per_gas
+                        .set(transaction.priority_fee_or_price() as f64);
                     AddedTransaction::Pending(AddedPendingTransaction {
                         transaction,
                         promoted,
