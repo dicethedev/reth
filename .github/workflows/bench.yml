@@ -74,8 +74,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  BASELINE: base
-  SEED: reth
   RUSTC_WRAPPER: "sccache"
   BENCH_RUNNERS: 2
 
@@ -712,11 +710,16 @@ jobs:
       - name: Check if snapshot needs update
         id: snapshot-check
         run: |
-          if .github/scripts/bench-reth-snapshot.sh --check; then
-            echo "needed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "needed=true" >> "$GITHUB_OUTPUT"
-          fi
+          set +e
+          .github/scripts/bench-reth-snapshot.sh --check
+          rc=$?
+          set -e
+          case "$rc" in
+            0)  echo "needed=false" >> "$GITHUB_OUTPUT" ;;
+            10) echo "needed=true"  >> "$GITHUB_OUTPUT" ;;
+            *)  echo "::error::Snapshot check failed (exit $rc)"
+                exit "$rc" ;;
+          esac
 
       - name: Update status (snapshot needed)
         if: env.BENCH_COMMENT_ID && steps.snapshot-check.outputs.needed == 'true'

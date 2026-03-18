@@ -11,7 +11,7 @@
 #
 # Required env:
 #   SCHELK_MOUNT       – schelk mount point (e.g. /reth-bench)
-#   BENCH_RETH_BINARY  – path to the reth binary (only for download, not --check)
+#   BENCH_RETH_BINARY  – path to the reth binary (required for download, not --check)
 #   GITHUB_TOKEN       – token for GitHub API calls (only for download)
 #   BENCH_COMMENT_ID   – PR comment ID to update (optional)
 #   BENCH_REPO         – owner/repo (e.g. paradigmxyz/reth)
@@ -27,7 +27,10 @@ DATADIR="$SCHELK_MOUNT/datadir"
 HASH_FILE="$HOME/.reth-bench-snapshot-hash"
 
 # Fetch manifest and compute content hash for reliable freshness check
-REMOTE_HASH=$($MC cat "${BUCKET}/${MANIFEST_PATH}" | sha256sum | awk '{print $1}')
+if ! REMOTE_HASH=$($MC cat "${BUCKET}/${MANIFEST_PATH}" 2>/dev/null | sha256sum | awk '{print $1}'); then
+  echo "::error::Failed to fetch snapshot manifest from ${BUCKET}/${MANIFEST_PATH}"
+  exit 2
+fi
 
 LOCAL_HASH=""
 [ -f "$HASH_FILE" ] && LOCAL_HASH=$(cat "$HASH_FILE")
@@ -39,17 +42,13 @@ fi
 
 echo "Snapshot needs update (local: ${LOCAL_HASH:+${LOCAL_HASH:0:16}…}${LOCAL_HASH:-<none>}, remote: ${REMOTE_HASH:0:16}…)"
 if [ "${1:-}" = "--check" ]; then
-  exit 1
+  exit 10
 fi
 
-RETH="${BENCH_RETH_BINARY:-$(cd "$(dirname "$0")/../.." && pwd)/../reth-feature/target/profiling/reth}"
-# When running in parallel with builds, the binary may not exist yet — wait for it.
-for _i in $(seq 1 600); do
-  [ -x "$RETH" ] && break
-  sleep 1
-done
+: "${BENCH_RETH_BINARY:?BENCH_RETH_BINARY must be set to the reth binary path}"
+RETH="$BENCH_RETH_BINARY"
 if [ ! -x "$RETH" ]; then
-  echo "::error::reth binary not found or not executable at $RETH after 600s"
+  echo "::error::reth binary not found or not executable at $RETH"
   exit 1
 fi
 
@@ -65,7 +64,7 @@ BASE_URL="${MINIO_ENDPOINT}/reth-snapshots/reth-1-minimal-stable"
 
 # Download manifest and replace base_url with the runner-reachable endpoint
 MANIFEST_TMP=$(mktemp --suffix=.json)
-trap 'rm -f "$MANIFEST_TMP"' EXIT
+trap 'rm -f -- "$MANIFEST_TMP"' EXIT
 $MC cat "${BUCKET}/${MANIFEST_PATH}" \
   | jq --arg base "$BASE_URL" '.base_url = $base' > "$MANIFEST_TMP"
 

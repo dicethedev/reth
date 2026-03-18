@@ -118,8 +118,12 @@ RETH_ARGS=(
   --authrpc.port 8551
   --disable-discovery
   --no-persist-peers
-  --debug.startup-sync-state-idle
 )
+
+# Gate flag on binary support (older baselines may not have it)
+if "$BINARY" node --help 2>/dev/null | grep -q -- '--debug.startup-sync-state-idle'; then
+  RETH_ARGS+=(--debug.startup-sync-state-idle)
+fi
 
 # Big blocks mode requires the testing API and skip-invalid-transactions
 if [ "$BIG_BLOCKS" = "true" ]; then
@@ -212,7 +216,7 @@ for i in $(seq 1 300); do
   SYNC_RESULT=$(curl -sf http://127.0.0.1:8545 -X POST \
     -H 'Content-Type: application/json' \
     -d '{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}' 2>/dev/null || true)
-  if [ -n "$SYNC_RESULT" ] && echo "$SYNC_RESULT" | jq -e '.result == false' > /dev/null 2>&1; then
+  if [ -n "$SYNC_RESULT" ] && jq -e '.result == false' <<< "$SYNC_RESULT" > /dev/null 2>&1; then
     echo "reth (${LABEL}) pipeline finished after ${i}s, engine is live"
     break
   fi
