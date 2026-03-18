@@ -22,7 +22,7 @@ set -euo pipefail
 
 MC="mc"
 BUCKET="minio/reth-snapshots"
-MANIFEST_PATH="reth-1-archive-edge-v2/manifest.json"
+MANIFEST_PATH="reth-1-minimal-stable/manifest.json"
 DATADIR="$SCHELK_MOUNT/datadir"
 HASH_FILE="$HOME/.reth-bench-snapshot-hash"
 
@@ -56,7 +56,7 @@ if [ -z "$MINIO_ENDPOINT" ] || [ "$MINIO_ENDPOINT" = "null" ]; then
   echo "::error::Failed to resolve MinIO endpoint from mc alias"
   exit 1
 fi
-BASE_URL="${MINIO_ENDPOINT}/reth-snapshots/reth-1-archive-edge-v2"
+BASE_URL="${MINIO_ENDPOINT}/reth-snapshots/reth-1-minimal-stable"
 
 # Download manifest and replace base_url with the runner-reachable endpoint
 MANIFEST_TMP=$(mktemp --suffix=.json)
