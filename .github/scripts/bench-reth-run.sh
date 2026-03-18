@@ -120,6 +120,11 @@ RETH_ARGS=(
   --no-persist-peers
 )
 
+# Match reth-bench-compare: stay "syncing" during initial backfill, then
+# report idle once minimal snapshot post-processing is done, even without a
+# beacon client.
+RETH_ARGS+=(--debug.startup-sync-state-idle)
+
 # Big blocks mode requires the testing API and skip-invalid-transactions
 if [ "$BIG_BLOCKS" = "true" ]; then
   RETH_ARGS+=(--http.api eth,net,web3,reth,testing --testing.skip-invalid-transactions)
