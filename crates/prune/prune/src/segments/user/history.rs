@@ -139,8 +139,9 @@ where
         for op in plan.ops {
             match op {
                 ShardOp::Delete(key) => {
-                    cursor.seek_exact(RawKey::new(key))?;
-                    cursor.delete_current()?;
+                    if cursor.seek_exact(RawKey::new(key))?.is_some() {
+                        cursor.delete_current()?;
+                    }
                 }
                 ShardOp::Put(key, list) => {
                     cursor.upsert(RawKey::new(key), &RawValue::new(list))?;

@@ -38,6 +38,10 @@ pub struct ShardPrunePlan<K> {
 }
 
 /// Aggregated stats across multiple shard groups.
+///
+/// Each field counts the number of **logical key groups** (not individual shard
+/// rows) that had the given outcome. For example, if a key has three shards and
+/// two are deleted, `deleted` is incremented by one (for that key group).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PrunedShardStats {
     /// Number of shard groups where at least one shard was deleted.
@@ -64,6 +68,14 @@ impl PrunedShardStats {
 /// This is backend-agnostic: it only inspects the shard data and returns
 /// a plan of operations. The caller applies the plan using backend-specific
 /// I/O (MDBX cursors, `RocksDB` batch, etc.).
+///
+/// The returned [`ShardPrunePlan::outcome`] represents the **per-group**
+/// summary: `Deleted` if any shard in the group was deleted, `Updated` if
+/// any was modified (but none deleted), or `Unchanged` otherwise.
+///
+/// If the input contains no sentinel shard (e.g. a partially-written state),
+/// the planner will still promote the last surviving shard to the sentinel
+/// position, effectively repairing the invariant.
 ///
 /// # Arguments
 ///
@@ -99,7 +111,8 @@ pub fn plan_shard_prune<K: Clone>(
         }
 
         let original_len = block_list.len();
-        let filtered = BlockNumberList::new_pre_sorted(block_list.iter().filter(|&b| b > to_block));
+        let filtered =
+            BlockNumberList::new_pre_sorted(block_list.iter().skip_while(|&b| b <= to_block));
 
         if filtered.is_empty() {
             ops.push(ShardOp::Delete(key));
@@ -216,12 +229,10 @@ mod tests {
     }
 
     #[test]
-    fn sentinel_empties_promotes_previous_shard() {
-        // Two shards: non-sentinel survives partially, sentinel empties
-        // After pruning to_block=10:
-        // - shard at key=8: blocks [5,8] → both <= 10, but key's highest is 8 <= 10 → delete
+    fn all_shards_fully_pruned() {
+        // Both shards are entirely within the prune range → both deleted.
+        // - shard at key=8: highest 8 <= 10 → delete (non-sentinel fast path)
         // - sentinel: blocks [7,9] → both <= 10 → delete (empties)
-        // No remaining shards → both deleted
         let plan = plan_shard_prune(
             vec![(8, make_list(&[5, 8])), (u64::MAX, make_list(&[7, 9]))],
             10,
@@ -230,13 +241,42 @@ mod tests {
             || u64::MAX,
         );
         assert_eq!(plan.outcome, PruneShardOutcome::Deleted);
+        assert_eq!(plan.ops.len(), 2);
+        assert!(matches!(plan.ops[0], ShardOp::Delete(8)));
+        assert!(matches!(plan.ops[1], ShardOp::Delete(u64::MAX)));
     }
 
     #[test]
-    fn non_sentinel_survives_gets_promoted_to_sentinel() {
-        // Non-sentinel shard partially survives, sentinel is empty
-        // shard at key=15: blocks [5, 12, 15] → filter > 10 → [12, 15]
-        // No sentinel shard present, so last_remaining=(15, [12,15]) is not sentinel → promote
+    fn sentinel_empties_previous_shard_promoted() {
+        // Non-sentinel shard survives, sentinel empties → promote survivor to sentinel.
+        // - shard at key=15: blocks [5, 12, 15] → skip_while <= 10 → [12, 15] (survives)
+        // - sentinel: blocks [7, 9] → both <= 10 → delete (empties)
+        // The surviving shard at key=15 must be promoted to sentinel (u64::MAX).
+        let plan = plan_shard_prune(
+            vec![(15, make_list(&[5, 12, 15])), (u64::MAX, make_list(&[7, 9]))],
+            10,
+            |k| *k,
+            |k| *k == u64::MAX,
+            || u64::MAX,
+        );
+        assert_eq!(plan.outcome, PruneShardOutcome::Deleted);
+        // Ops: Put(15, [12,15]), Delete(sentinel), Delete(15), Put(sentinel, [12,15])
+        assert_eq!(plan.ops.len(), 4);
+        // Last op should be the sentinel promotion
+        match &plan.ops[plan.ops.len() - 1] {
+            ShardOp::Put(k, list) => {
+                assert_eq!(*k, u64::MAX);
+                assert_eq!(list.iter().collect::<Vec<_>>(), vec![12, 15]);
+            }
+            _ => panic!("expected Put for sentinel promotion"),
+        }
+    }
+
+    #[test]
+    fn missing_sentinel_repaired_by_promotion() {
+        // Input has no sentinel shard (e.g. partially-written state).
+        // The planner should still promote the last surviving shard to sentinel.
+        // shard at key=15: blocks [5, 12, 15] → skip_while <= 10 → [12, 15]
         let plan = plan_shard_prune(
             vec![(15, make_list(&[5, 12, 15]))],
             10,
@@ -245,8 +285,45 @@ mod tests {
             || u64::MAX,
         );
         assert_eq!(plan.outcome, PruneShardOutcome::Updated);
-        // Should: put filtered at key=15, then delete key=15 and put at sentinel
-        // The ops are: Put(15, [12,15]), Delete(15), Put(MAX, [12,15])
+        // Ops: Put(15, [12,15]), Delete(15), Put(MAX, [12,15])
         assert_eq!(plan.ops.len(), 3);
+        match &plan.ops[2] {
+            ShardOp::Put(k, list) => {
+                assert_eq!(*k, u64::MAX);
+                assert_eq!(list.iter().collect::<Vec<_>>(), vec![12, 15]);
+            }
+            _ => panic!("expected Put for sentinel promotion"),
+        }
+    }
+
+    #[test]
+    fn multi_shard_mixed_outcomes() {
+        // Three shards: first deleted, second partially pruned, sentinel unchanged.
+        // - shard at key=5: highest 5 <= 10 → delete
+        // - shard at key=15: blocks [8, 12, 15] → skip_while <= 10 → [12, 15]
+        // - sentinel: blocks [20, 25] → all > 10 → unchanged
+        let plan = plan_shard_prune(
+            vec![
+                (5, make_list(&[1, 3, 5])),
+                (15, make_list(&[8, 12, 15])),
+                (u64::MAX, make_list(&[20, 25])),
+            ],
+            10,
+            |k| *k,
+            |k| *k == u64::MAX,
+            || u64::MAX,
+        );
+        assert_eq!(plan.outcome, PruneShardOutcome::Deleted);
+        // Ops: Delete(5), Put(15, [12,15])
+        // Sentinel is unchanged (and is already sentinel), no promotion needed.
+        assert_eq!(plan.ops.len(), 2);
+        assert!(matches!(plan.ops[0], ShardOp::Delete(5)));
+        match &plan.ops[1] {
+            ShardOp::Put(k, list) => {
+                assert_eq!(*k, 15);
+                assert_eq!(list.iter().collect::<Vec<_>>(), vec![12, 15]);
+            }
+            _ => panic!("expected Put"),
+        }
     }
 }

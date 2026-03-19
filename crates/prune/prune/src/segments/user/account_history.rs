@@ -161,7 +161,7 @@ impl AccountHistory {
             &limiter,
             ShardedKey::new,
             |a, b| a.key == b.key,
-            |key| ShardedKey::new(key.key, u64::MAX),
+            |key| ShardedKey::last(key.key),
         )
         .map_err(Into::into)
     }
@@ -224,7 +224,7 @@ impl AccountHistory {
             &limiter,
             ShardedKey::new,
             |a, b| a.key == b.key,
-            |key| ShardedKey::new(key.key, u64::MAX),
+            |key| ShardedKey::last(key.key),
         )
         .map_err(Into::into)
     }
