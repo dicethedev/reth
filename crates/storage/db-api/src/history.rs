@@ -50,7 +50,7 @@ pub struct PrunedShardStats {
 
 impl PrunedShardStats {
     /// Record the outcome of one shard group.
-    pub fn record(&mut self, outcome: PruneShardOutcome) {
+    pub const fn record(&mut self, outcome: PruneShardOutcome) {
         match outcome {
             PruneShardOutcome::Deleted => self.deleted += 1,
             PruneShardOutcome::Updated => self.updated += 1,
@@ -63,7 +63,7 @@ impl PrunedShardStats {
 ///
 /// This is backend-agnostic: it only inspects the shard data and returns
 /// a plan of operations. The caller applies the plan using backend-specific
-/// I/O (MDBX cursors, RocksDB batch, etc.).
+/// I/O (MDBX cursors, `RocksDB` batch, etc.).
 ///
 /// # Arguments
 ///
@@ -116,12 +116,12 @@ pub fn plan_shard_prune<K: Clone>(
 
     // If the last surviving shard is not the sentinel, promote it:
     // delete the old key and re-insert under the sentinel key.
-    if let Some((last_key, last_value)) = last_remaining {
-        if !is_sentinel(&last_key) {
-            ops.push(ShardOp::Delete(last_key));
-            ops.push(ShardOp::Put(make_sentinel(), last_value));
-            updated = true;
-        }
+    if let Some((last_key, last_value)) = last_remaining &&
+        !is_sentinel(&last_key)
+    {
+        ops.push(ShardOp::Delete(last_key));
+        ops.push(ShardOp::Put(make_sentinel(), last_value));
+        updated = true;
     }
 
     let outcome = if deleted {
