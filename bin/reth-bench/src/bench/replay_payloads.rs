@@ -268,15 +268,22 @@ impl Command {
                     .unwrap_or_default(),
             };
 
-            let fcu_state = ForkchoiceState {
-                head_block_hash: block_hash,
-                safe_block_hash: parent_hash,
-                finalized_block_hash: parent_hash,
-            };
+            // Skip FCU for big blocks with a zeroed block hash — the node rejects
+            // forkchoice updates pointing to a zero hash since it's not a real block.
+            let fcu_latency = if block_hash.is_zero() {
+                debug!(target: "reth-bench", "Skipping FCU for big block with zero hash");
+                Duration::ZERO
+            } else {
+                let fcu_state = ForkchoiceState {
+                    head_block_hash: block_hash,
+                    safe_block_hash: parent_hash,
+                    finalized_block_hash: parent_hash,
+                };
 
-            let fcu_start = Instant::now();
-            call_forkchoice_updated_with_reth(&auth_provider, version, fcu_state).await?;
-            let fcu_latency = fcu_start.elapsed();
+                let fcu_start = Instant::now();
+                call_forkchoice_updated_with_reth(&auth_provider, version, fcu_state).await?;
+                fcu_start.elapsed()
+            };
 
             let total_latency =
                 if server_timings.is_some() { np_latency + fcu_latency } else { start.elapsed() };
