@@ -451,12 +451,12 @@ where
             .map_err(NewPayloadError::other)?;
 
         let has_env_switches = !env_switches.is_empty();
-        let switch_envs: Vec<(usize, EvmEnvFor<Evm>)> = ensure_ok!(env_switches
-            .iter()
+        let switch_envs: Vec<(usize, EvmEnvFor<Evm>, T::ExecutionData)> = ensure_ok!(env_switches
+            .into_iter()
             .map(|(tx_idx, data)| {
                 self.evm_config
-                    .evm_env_for_payload(data)
-                    .map(|env| (*tx_idx, env))
+                    .evm_env_for_payload(&data)
+                    .map(|env| (tx_idx, env, data))
                     .map_err(|e| Box::new(e) as Box<dyn core::error::Error + Send + Sync>)
             })
             .collect::<Result<_, _>>());
@@ -886,7 +886,7 @@ where
         env: ExecutionEnv<Evm>,
         input: &BlockOrPayload<T>,
         handle: &mut PayloadHandle<impl ExecutableTxFor<Evm>, Err, N::Receipt>,
-        switch_envs: Vec<(usize, EvmEnvFor<Evm>)>,
+        switch_envs: Vec<(usize, EvmEnvFor<Evm>, T::ExecutionData)>,
     ) -> Result<
         (
             BlockExecutionOutput<N::Receipt>,
@@ -903,6 +903,16 @@ where
         Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
     {
         debug!(target: "engine::tree::payload_validator", "Executing block");
+
+        // Sort and split env_switch data upfront. The ExecutionData vec is declared before
+        // the executor so it outlives it (Rust drops in reverse declaration order), allowing
+        // the executor to borrow from elements across loop iterations.
+        let mut switch_envs = switch_envs;
+        switch_envs.sort_by_key(|(idx, _, _)| *idx);
+        let (switch_indices_envs, switch_data_vec): (
+            Vec<(usize, EvmEnvFor<Evm>)>,
+            Vec<T::ExecutionData>,
+        ) = switch_envs.into_iter().map(|(idx, env, data)| ((idx, env), data)).unzip();
 
         let mut db = debug_span!(target: "engine::tree", "build_state_db").in_scope(|| {
             State::builder()
@@ -975,13 +985,9 @@ where
         let mut accumulated_blob_gas_used: u64 = 0;
         let mut accumulated_requests = alloy_eips::eip7685::Requests::default();
 
-        // Sort switch_envs by tx index for sequential processing
-        let mut switch_envs = switch_envs;
-        switch_envs.sort_by_key(|(idx, _)| *idx);
-
         // Process each segment: execute txs up to the next switch boundary, then finish
         // the current executor (applying post-execution changes), swap the env, and continue.
-        for (switch_idx, switch_env) in switch_envs.into_iter() {
+        for (i, (switch_idx, switch_env)) in switch_indices_envs.into_iter().enumerate() {
             // Execute transactions up to this switch boundary
             self.execute_transactions(
                 &mut executor,
@@ -1009,9 +1015,11 @@ where
                 switch_idx,
                 "Switching EVM environment at tx boundary"
             );
+
             let new_evm = self.evm_config.evm_with_env(reclaimed_db, switch_env);
             let ctx = self
-                .execution_ctx_for(input)
+                .evm_config
+                .context_for_payload(&switch_data_vec[i])
                 .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?;
             executor = self.evm_config.create_executor(new_evm, ctx);
 
