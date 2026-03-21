@@ -252,6 +252,11 @@ pub struct BigBlockPayload {
     pub execution_data: ExecutionData,
     /// Environment switches at block boundaries.
     /// Each entry is `(cumulative_tx_count, execution_data_of_next_block)`.
+    ///
+    /// The first entry at index 0 represents the **original unmutated** base block's
+    /// `ExecutionData`, which must be used to derive the initial EVM environment
+    /// (basefee, gas_limit, etc.) for segment 0. Without this, segment 0 would
+    /// execute with the synthetic merged header's inflated gas_limit.
     pub env_switches: Vec<(usize, ExecutionData)>,
 }
 
@@ -361,6 +366,12 @@ impl Command {
             let mut env_switches = Vec::new();
 
             if !blocks.is_empty() {
+                // Store the original unmutated base block as env_switch at index 0.
+                // This preserves the real gas_limit, basefee, etc. for segment 0's
+                // EVM environment, which would otherwise be lost when we mutate the
+                // base payload header below.
+                env_switches.push((0, base.clone()));
+
                 let mut cumulative_tx_count = base.payload.transactions().len();
 
                 // Collect state from the last block for header fields

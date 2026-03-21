@@ -347,7 +347,7 @@ where
     pub fn validate_block_with_state<T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>>(
         &mut self,
         input: BlockOrPayload<T>,
-        env_switches: Vec<(usize, T::ExecutionData)>,
+        mut env_switches: Vec<(usize, T::ExecutionData)>,
         mut ctx: TreeCtx<'_, N>,
     ) -> InsertPayloadResult<N>
     where
@@ -446,11 +446,39 @@ where
             .into())
         };
 
-        let evm_env = debug_span!(target: "engine::tree::payload_validator", "evm_env")
-            .in_scope(|| self.evm_env_for(&input))
-            .map_err(NewPayloadError::other)?;
-
         let has_env_switches = !env_switches.is_empty();
+
+        // If the first env_switch is at tx index 0, it carries the original unmutated
+        // base block's ExecutionData. Use it to derive the initial EVM environment
+        // instead of the mutated merged payload (which has inflated gas_limit, etc.).
+        let initial_env_data = if env_switches.first().is_some_and(|(idx, _)| *idx == 0) {
+            Some(env_switches.remove(0).1)
+        } else {
+            None
+        };
+
+        let evm_env = if let Some(ref data) = initial_env_data {
+            let env = debug_span!(target: "engine::tree::payload_validator", "evm_env")
+                .in_scope(|| self.evm_config.evm_env_for_payload(data))
+                .map_err(NewPayloadError::other)?;
+            info!(
+                target: "engine::tree::payload_validator",
+                "Using initial env_switch data for segment 0 EVM env"
+            );
+            env
+        } else {
+            debug_span!(target: "engine::tree::payload_validator", "evm_env")
+                .in_scope(|| self.evm_env_for(&input))
+                .map_err(NewPayloadError::other)?
+        };
+
+        info!(
+            target: "engine::tree::payload_validator",
+            env_switches_remaining = env_switches.len(),
+            has_env_switches,
+            "env_switch state after initial extraction"
+        );
+
         let switch_envs: Vec<(usize, EvmEnvFor<Evm>, T::ExecutionData)> = ensure_ok!(env_switches
             .into_iter()
             .map(|(tx_idx, data)| {
@@ -539,11 +567,17 @@ where
         // The receipt root task is spawned before execution and receives receipts incrementally
         // as transactions complete, allowing parallel computation during execution.
         let execute_block_start = Instant::now();
-        let (output, senders, receipt_root_rx) =
-            match self.execute_block(state_provider, env, &input, &mut handle, switch_envs) {
-                Ok(output) => output,
-                Err(err) => return self.handle_execution_error(input, err, &parent_block),
-            };
+        let (output, senders, receipt_root_rx) = match self.execute_block(
+            state_provider,
+            env,
+            &input,
+            &mut handle,
+            switch_envs,
+            initial_env_data,
+        ) {
+            Ok(output) => output,
+            Err(err) => return self.handle_execution_error(input, err, &parent_block),
+        };
         let execution_duration = execute_block_start.elapsed();
 
         // After executing the block we can stop prewarming transactions
@@ -887,6 +921,7 @@ where
         input: &BlockOrPayload<T>,
         handle: &mut PayloadHandle<impl ExecutableTxFor<Evm>, Err, N::Receipt>,
         switch_envs: Vec<(usize, EvmEnvFor<Evm>, T::ExecutionData)>,
+        initial_env_data: Option<T::ExecutionData>,
     ) -> Result<
         (
             BlockExecutionOutput<N::Receipt>,
@@ -921,13 +956,25 @@ where
                 .build()
         });
 
+        // The initial_env_data vec is declared before the executor so it outlives it,
+        // allowing the executor to borrow from it for the initial segment's context.
+        let initial_env_data_storage = initial_env_data;
         let (spec_id, mut executor) = {
             let _span = debug_span!(target: "engine::tree", "create_evm").entered();
             let spec_id = *env.evm_env.spec_id();
             let evm = self.evm_config.evm_with_env(&mut db, env.evm_env);
-            let ctx = self
-                .execution_ctx_for(input)
-                .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?;
+            // Use the original base block's ExecutionData for the initial segment's
+            // context when available (env_switch at tx_idx=0). This ensures correct
+            // parent_hash, withdrawals, etc. for chained big blocks where the merged
+            // payload's parent_hash is mutated.
+            let ctx = if let Some(ref data) = initial_env_data_storage {
+                self.evm_config
+                    .context_for_payload(data)
+                    .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?
+            } else {
+                self.execution_ctx_for(input)
+                    .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?
+            };
             let executor = self.evm_config.create_executor(evm, ctx);
             (spec_id, executor)
         };
@@ -967,6 +1014,13 @@ where
             handle.state_hook().map(|hook| Box::new(hook) as Box<dyn OnStateHook>),
         );
 
+        // Pre-create state hooks for each env_switch segment so they can be attached
+        // to new executors without borrowing `handle` during the transaction loop.
+        let mut segment_state_hooks: Vec<Option<Box<dyn OnStateHook>>> = switch_indices_envs
+            .iter()
+            .map(|_| handle.state_hook().map(|hook| Box::new(hook) as Box<dyn OnStateHook>))
+            .collect();
+
         let execution_start = Instant::now();
 
         // Apply pre-execution changes for the initial segment (e.g., beacon root update)
@@ -1003,16 +1057,32 @@ where
             // Finish the current executor (applies post-execution changes: withdrawals,
             // rewards, system calls) and reclaim the EVM + DB.
             let (evm, segment_result) = executor.finish()?;
+            let segment_receipt_count = segment_result.receipts.len();
+            let segment_gas = segment_result.gas_used;
             accumulated_receipts.extend(segment_result.receipts);
-            accumulated_gas_used += segment_result.gas_used;
+            accumulated_gas_used += segment_gas;
             accumulated_blob_gas_used += segment_result.blob_gas_used;
             accumulated_requests.extend(segment_result.requests);
 
             // Reclaim the DB from the EVM, create a new EVM with the switched env
             let reclaimed_db = evm.into_db();
-            debug!(
+
+            // Seed the block hash for the just-finished segment into the State's
+            // block_hashes cache. Without this, BLOCKHASH opcodes in subsequent
+            // segments that reference virtual block numbers (not yet in the DB)
+            // would return zero instead of the real hash.
+            let finished_block_number = ExecutionPayload::block_number(&switch_data_vec[i]) - 1;
+            let finished_block_hash = ExecutionPayload::parent_hash(&switch_data_vec[i]);
+            reclaimed_db.block_hashes.insert(finished_block_number, finished_block_hash);
+
+            info!(
                 target: "engine::tree::payload_validator",
                 switch_idx,
+                segment_gas_used = segment_gas,
+                segment_receipts = segment_receipt_count,
+                total_senders = senders.len(),
+                finished_block_number,
+                %finished_block_hash,
                 "Switching EVM environment at tx boundary"
             );
 
@@ -1022,6 +1092,10 @@ where
                 .context_for_payload(&switch_data_vec[i])
                 .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?;
             executor = self.evm_config.create_executor(new_evm, ctx);
+
+            // Re-attach state hook so subsequent segments feed state changes to the
+            // state root task. Without this, only segment 0's changes are visible.
+            executor.set_state_hook(segment_state_hooks[i].take());
 
             // Re-attach precompile cache to the new executor
             if !self.config.precompile_cache_disabled() {
@@ -1069,6 +1143,15 @@ where
             .in_scope(|| executor.finish())?;
 
         // Aggregate the final segment's results
+        info!(
+            target: "engine::tree::payload_validator",
+            final_segment_gas = final_result.gas_used,
+            final_segment_receipts = final_result.receipts.len(),
+            total_senders = senders.len(),
+            total_accumulated_gas = accumulated_gas_used + final_result.gas_used,
+            total_accumulated_receipts = accumulated_receipts.len() + final_result.receipts.len(),
+            "Final segment completed"
+        );
         accumulated_receipts.extend(final_result.receipts);
         accumulated_gas_used += final_result.gas_used;
         accumulated_blob_gas_used += final_result.blob_gas_used;
@@ -1090,7 +1173,15 @@ where
         debug_span!(target: "engine::tree", "merge_transitions")
             .in_scope(|| db.merge_transitions(BundleRetention::Reverts));
 
-        let output = BlockExecutionOutput { result, state: db.take_bundle() };
+        let bundle = db.take_bundle();
+        info!(
+            target: "engine::tree::payload_validator",
+            bundle_accounts = bundle.state.len(),
+            bundle_contracts = bundle.contracts.len(),
+            bundle_reverts_len = bundle.reverts.len(),
+            "Bundle state after execution"
+        );
+        let output = BlockExecutionOutput { result, state: bundle };
 
         let execution_duration = execution_start.elapsed();
         self.metrics.record_block_execution(&output, execution_duration);

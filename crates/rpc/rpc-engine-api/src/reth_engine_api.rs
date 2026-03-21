@@ -38,7 +38,7 @@ impl<Payload: PayloadTypes> RethEngineApiServer<Payload::ExecutionData> for Reth
         let wait_for_persistence = wait_for_persistence.unwrap_or(true);
         let wait_for_caches = wait_for_caches.unwrap_or(true);
         let env_switches = env_switches.unwrap_or_default();
-        trace!(target: "rpc::engine", wait_for_persistence, wait_for_caches, "Serving reth_newPayload");
+        tracing::info!(target: "rpc::engine", wait_for_persistence, wait_for_caches, env_switches = env_switches.len(), "Serving reth_newPayload");
 
         let payload = match input {
             RethNewPayloadInput::ExecutionData(data) => data,
