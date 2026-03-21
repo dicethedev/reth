@@ -10854,14 +10854,16 @@ dependencies = [
 [[package]]
 name = "revmc"
 version = "0.1.0"
-source = "git+https://github.com/paradigmxyz/revmc?rev=522ee6ea#522ee6ea87bdda1b44694f1be19c81855e7bee49"
+source = "git+https://github.com/paradigmxyz/revmc?rev=968a0e27#968a0e27cba503f2ea7b37c3274334ea2dd2a653"
 dependencies = [
+ "alloy-evm",
  "alloy-primitives",
  "bitflags 2.11.0",
  "bitvec",
  "dashmap",
  "either",
  "libloading 0.9.0",
+ "revm",
  "revm-bytecode",
  "revm-context-interface",
  "revm-interpreter",
@@ -10879,7 +10881,7 @@ dependencies = [
 [[package]]
 name = "revmc-backend"
 version = "0.1.0"
-source = "git+https://github.com/paradigmxyz/revmc?rev=522ee6ea#522ee6ea87bdda1b44694f1be19c81855e7bee49"
+source = "git+https://github.com/paradigmxyz/revmc?rev=968a0e27#968a0e27cba503f2ea7b37c3274334ea2dd2a653"
 dependencies = [
  "eyre",
  "ruint",
@@ -10888,12 +10890,12 @@ dependencies = [
 [[package]]
 name = "revmc-build"
 version = "0.1.0"
-source = "git+https://github.com/paradigmxyz/revmc?rev=522ee6ea#522ee6ea87bdda1b44694f1be19c81855e7bee49"
+source = "git+https://github.com/paradigmxyz/revmc?rev=968a0e27#968a0e27cba503f2ea7b37c3274334ea2dd2a653"
 
 [[package]]
 name = "revmc-builtins"
 version = "0.1.0"
-source = "git+https://github.com/paradigmxyz/revmc?rev=522ee6ea#522ee6ea87bdda1b44694f1be19c81855e7bee49"
+source = "git+https://github.com/paradigmxyz/revmc?rev=968a0e27#968a0e27cba503f2ea7b37c3274334ea2dd2a653"
 dependencies = [
  "paste",
  "revm-bytecode",
@@ -10908,7 +10910,7 @@ dependencies = [
 [[package]]
 name = "revmc-context"
 version = "0.1.0"
-source = "git+https://github.com/paradigmxyz/revmc?rev=522ee6ea#522ee6ea87bdda1b44694f1be19c81855e7bee49"
+source = "git+https://github.com/paradigmxyz/revmc?rev=968a0e27#968a0e27cba503f2ea7b37c3274334ea2dd2a653"
 dependencies = [
  "revm-interpreter",
  "revm-primitives",
@@ -10918,7 +10920,7 @@ dependencies = [
 [[package]]
 name = "revmc-llvm"
 version = "0.1.0"
-source = "git+https://github.com/paradigmxyz/revmc?rev=522ee6ea#522ee6ea87bdda1b44694f1be19c81855e7bee49"
+source = "git+https://github.com/paradigmxyz/revmc?rev=968a0e27#968a0e27cba503f2ea7b37c3274334ea2dd2a653"
 dependencies = [
  "inkwell",
  "revmc-backend",
