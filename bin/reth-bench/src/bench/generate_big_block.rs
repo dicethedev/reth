@@ -273,6 +273,13 @@ pub struct Command {
     #[arg(long, value_name = "COUNT", default_value = "1")]
     count: u64,
 
+    /// Number of sequential big blocks to generate.
+    ///
+    /// Each big block merges `--count` real blocks. Sequential big blocks are chained:
+    /// block N+1's `parent_hash` is set to block N's computed hash.
+    #[arg(long, value_name = "NUM_BIG_BLOCKS", default_value = "1")]
+    num_big_blocks: u64,
+
     /// Output directory for generated payloads.
     #[arg(long, value_name = "OUTPUT_DIR")]
     output_dir: std::path::PathBuf,
@@ -284,13 +291,17 @@ impl Command {
         if self.count == 0 {
             return Err(eyre::eyre!("--count must be at least 1"));
         }
+        if self.num_big_blocks == 0 {
+            return Err(eyre::eyre!("--num-big-blocks must be at least 1"));
+        }
 
         info!(
             target: "reth-bench",
             from_block = self.from_block,
             count = self.count,
+            num_big_blocks = self.num_big_blocks,
             output_dir = %self.output_dir.display(),
-            "Generating big block payload"
+            "Generating big block payloads"
         );
 
         // Create output directory
@@ -304,109 +315,123 @@ impl Command {
             .http(self.rpc_url.parse()?);
         let provider = RootProvider::<AnyNetwork>::new(client);
 
-        // Fetch all blocks with full transactions
-        let mut blocks = Vec::with_capacity(self.count as usize);
-        for i in 0..self.count {
-            let block_number = self.from_block + i;
-            info!(target: "reth-bench", block_number, "Fetching block");
+        let mut prev_big_block_hash: Option<B256> = None;
 
-            let rpc_block = provider
-                .get_block_by_number(block_number.into())
-                .full()
-                .await?
-                .ok_or_else(|| eyre::eyre!("Block {} not found", block_number))?;
+        for big_block_idx in 0..self.num_big_blocks {
+            let range_start = self.from_block + big_block_idx * self.count;
 
-            // Convert to consensus block
-            let block = rpc_block
-                .into_inner()
-                .map_header(|header| header.map(|h| h.into_header_with_defaults()))
-                .try_map_transactions(|tx| {
-                    tx.try_into_either::<op_alloy_consensus::OpTxEnvelope>()
-                })?
-                .into_consensus();
+            // Fetch all blocks with full transactions
+            let mut blocks = Vec::with_capacity(self.count as usize);
+            for i in 0..self.count {
+                let block_number = range_start + i;
+                info!(target: "reth-bench", block_number, big_block = big_block_idx, "Fetching block");
 
-            // Convert to ExecutionData
-            let (payload, sidecar) = ExecutionPayload::from_block_slow(&block);
-            let execution_data = ExecutionData { payload, sidecar };
+                let rpc_block = provider
+                    .get_block_by_number(block_number.into())
+                    .full()
+                    .await?
+                    .ok_or_else(|| eyre::eyre!("Block {} not found", block_number))?;
+
+                // Convert to consensus block
+                let block = rpc_block
+                    .into_inner()
+                    .map_header(|header| header.map(|h| h.into_header_with_defaults()))
+                    .try_map_transactions(|tx| {
+                        tx.try_into_either::<op_alloy_consensus::OpTxEnvelope>()
+                    })?
+                    .into_consensus();
+
+                // Convert to ExecutionData
+                let (payload, sidecar) = ExecutionPayload::from_block_slow(&block);
+                let execution_data = ExecutionData { payload, sidecar };
+
+                info!(
+                    target: "reth-bench",
+                    block_number,
+                    gas_used = execution_data.payload.as_v1().gas_used,
+                    tx_count = execution_data.payload.transactions().len(),
+                    "Fetched block"
+                );
+
+                blocks.push(execution_data);
+            }
+
+            // Block 0 is the base
+            let mut base = blocks.remove(0);
+            let mut env_switches = Vec::new();
+
+            if !blocks.is_empty() {
+                let mut cumulative_tx_count = base.payload.transactions().len();
+
+                // Collect state from the last block for header fields
+                let last = blocks.last().unwrap();
+                let last_v1 = last.payload.as_v1();
+                let final_state_root = last_v1.state_root;
+                let final_receipts_root = last_v1.receipts_root;
+                let final_logs_bloom = last_v1.logs_bloom;
+
+                let mut total_gas_used = base.payload.as_v1().gas_used;
+                let mut total_gas_limit = base.payload.as_v1().gas_limit;
+
+                // Concatenate transactions from subsequent blocks and build env_switches
+                for block_data in blocks {
+                    let block_v1 = block_data.payload.as_v1();
+                    total_gas_used += block_v1.gas_used;
+                    total_gas_limit += block_v1.gas_limit;
+
+                    // Record environment switch at this block boundary
+                    env_switches.push((cumulative_tx_count, block_data.clone()));
+
+                    // Append this block's transactions to the base payload
+                    let txs = block_data.payload.transactions().clone();
+                    cumulative_tx_count += txs.len();
+                    base.payload.transactions_mut().extend(txs);
+                }
+
+                // Mutate the base payload header
+                let base_v1 = base.payload.as_v1_mut();
+                base_v1.state_root = final_state_root;
+                base_v1.gas_used = total_gas_used;
+                base_v1.gas_limit = total_gas_limit;
+                base_v1.receipts_root = final_receipts_root;
+                base_v1.logs_bloom = final_logs_bloom;
+            }
+
+            // Chain sequential big blocks: set parent_hash to the previous big block's hash
+            if let Some(prev_hash) = prev_big_block_hash {
+                base.payload.as_v1_mut().parent_hash = prev_hash;
+            }
+
+            // Merge blob versioned hashes from all constituent blocks into the base sidecar
+            let additional_blocks: Vec<ExecutionData> =
+                env_switches.iter().map(|(_, data)| data.clone()).collect();
+            merge_blob_data(&mut base, &additional_blocks);
+
+            // Compute the real block hash from the mutated payload
+            let block_hash = compute_payload_block_hash(&base)?;
+            base.payload.as_v1_mut().block_hash = block_hash;
+            prev_big_block_hash = Some(block_hash);
+
+            let big_block = BigBlockPayload { execution_data: base, env_switches };
+
+            // Save to disk
+            let range_end = range_start + self.count - 1;
+            let filename = format!("big_block_{range_start}_to_{range_end}.json");
+            let filepath = self.output_dir.join(&filename);
+            let json = serde_json::to_string_pretty(&big_block)?;
+            std::fs::write(&filepath, &json)
+                .wrap_err_with(|| format!("Failed to write payload to {:?}", filepath))?;
 
             info!(
                 target: "reth-bench",
-                block_number,
-                gas_used = execution_data.payload.as_v1().gas_used,
-                tx_count = execution_data.payload.transactions().len(),
-                "Fetched block"
+                path = %filepath.display(),
+                block_hash = %block_hash,
+                total_txs = big_block.execution_data.payload.transactions().len(),
+                total_gas_used = big_block.execution_data.payload.as_v1().gas_used,
+                env_switches = big_block.env_switches.len(),
+                "Big block payload saved"
             );
-
-            blocks.push(execution_data);
         }
-
-        // Block 0 is the base
-        let mut base = blocks.remove(0);
-        let mut env_switches = Vec::new();
-
-        if !blocks.is_empty() {
-            let mut cumulative_tx_count = base.payload.transactions().len();
-
-            // Collect state from the last block for header fields
-            let last = blocks.last().unwrap();
-            let last_v1 = last.payload.as_v1();
-            let final_state_root = last_v1.state_root;
-            let final_receipts_root = last_v1.receipts_root;
-            let final_logs_bloom = last_v1.logs_bloom;
-
-            let mut total_gas_used = base.payload.as_v1().gas_used;
-            let mut total_gas_limit = base.payload.as_v1().gas_limit;
-
-            // Concatenate transactions from subsequent blocks and build env_switches
-            for block_data in blocks {
-                let block_v1 = block_data.payload.as_v1();
-                total_gas_used += block_v1.gas_used;
-                total_gas_limit += block_v1.gas_limit;
-
-                // Record environment switch at this block boundary
-                env_switches.push((cumulative_tx_count, block_data.clone()));
-
-                // Append this block's transactions to the base payload
-                let txs = block_data.payload.transactions().clone();
-                cumulative_tx_count += txs.len();
-                base.payload.transactions_mut().extend(txs);
-            }
-
-            // Mutate the base payload header
-            let base_v1 = base.payload.as_v1_mut();
-            base_v1.state_root = final_state_root;
-            base_v1.gas_used = total_gas_used;
-            base_v1.gas_limit = total_gas_limit;
-            base_v1.receipts_root = final_receipts_root;
-            base_v1.logs_bloom = final_logs_bloom;
-        }
-
-        // Merge blob versioned hashes from all constituent blocks into the base sidecar
-        let additional_blocks: Vec<ExecutionData> =
-            env_switches.iter().map(|(_, data)| data.clone()).collect();
-        merge_blob_data(&mut base, &additional_blocks);
-
-        // Compute the real block hash from the mutated payload
-        base.payload.as_v1_mut().block_hash = compute_payload_block_hash(&base)?;
-
-        let big_block = BigBlockPayload { execution_data: base, env_switches };
-
-        // Save to disk
-        let filename =
-            format!("big_block_{}_to_{}.json", self.from_block, self.from_block + self.count - 1);
-        let filepath = self.output_dir.join(&filename);
-        let json = serde_json::to_string_pretty(&big_block)?;
-        std::fs::write(&filepath, &json)
-            .wrap_err_with(|| format!("Failed to write payload to {:?}", filepath))?;
-
-        info!(
-            target: "reth-bench",
-            path = %filepath.display(),
-            total_txs = big_block.execution_data.payload.transactions().len(),
-            total_gas_used = big_block.execution_data.payload.as_v1().gas_used,
-            env_switches = big_block.env_switches.len(),
-            "Big block payload saved"
-        );
 
         Ok(())
     }
