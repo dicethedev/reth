@@ -115,6 +115,8 @@ struct LoadedPayload {
     block_hash: B256,
     /// Environment switches to apply at specific transaction indices.
     env_switches: Vec<(usize, ExecutionData)>,
+    /// Real block hashes for blocks covered by previous big blocks.
+    prior_block_hashes: Vec<(u64, B256)>,
 }
 
 impl Command {
@@ -226,6 +228,11 @@ impl Command {
                 } else {
                     Some(payload.env_switches.clone())
                 };
+                let prior_block_hashes_param = if payload.prior_block_hashes.is_empty() {
+                    None
+                } else {
+                    Some(payload.prior_block_hashes.clone())
+                };
                 (
                     None,
                     serde_json::to_value((
@@ -233,6 +240,7 @@ impl Command {
                         self.no_wait_for_persistence.then_some(false),
                         self.no_wait_for_caches.then_some(false),
                         env_switches_param,
+                        prior_block_hashes_param,
                     ))?,
                 )
             } else {
@@ -390,9 +398,9 @@ impl Command {
                 .wrap_err_with(|| format!("Failed to read {:?}", path))?;
 
             // Try BigBlockPayload first, then fall back to legacy ExecutionPayloadEnvelopeV4
-            let (execution_data, env_switches) =
+            let (execution_data, env_switches, prior_block_hashes) =
                 if let Ok(big_block) = serde_json::from_str::<BigBlockPayload>(&content) {
-                    (big_block.execution_data, big_block.env_switches)
+                    (big_block.execution_data, big_block.env_switches, big_block.prior_block_hashes)
                 } else {
                     let envelope: ExecutionPayloadEnvelopeV4 = serde_json::from_str(&content)
                         .wrap_err_with(|| format!("Failed to parse {:?}", path))?;
@@ -408,7 +416,7 @@ impl Command {
                             },
                         ),
                     };
-                    (execution_data, Vec::new())
+                    (execution_data, Vec::new(), Vec::new())
                 };
 
             let block_hash = execution_data.payload.as_v1().block_hash;
@@ -418,11 +426,18 @@ impl Command {
                 index = index,
                 block_hash = %block_hash,
                 env_switches = env_switches.len(),
+                prior_block_hashes = prior_block_hashes.len(),
                 path = %path.display(),
                 "Loaded payload"
             );
 
-            payloads.push(LoadedPayload { index, execution_data, block_hash, env_switches });
+            payloads.push(LoadedPayload {
+                index,
+                execution_data,
+                block_hash,
+                env_switches,
+                prior_block_hashes,
+            });
         }
 
         Ok(payloads)

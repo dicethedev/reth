@@ -1,6 +1,6 @@
 //! Reth-specific engine API extensions.
 
-use alloy_primitives::Bytes;
+use alloy_primitives::{Bytes, B256};
 use alloy_rpc_types_engine::{ForkchoiceState, ForkchoiceUpdated, PayloadStatus};
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use serde::{Deserialize, Serialize};
@@ -67,6 +67,7 @@ pub trait RethEngineApi<ExecutionData> {
         wait_for_persistence: Option<bool>,
         wait_for_caches: Option<bool>,
         env_switches: Option<Vec<(usize, ExecutionData)>>,
+        prior_block_hashes: Option<Vec<(u64, B256)>>,
     ) -> RpcResult<RethPayloadStatus>;
 
     /// Reth-specific forkchoiceUpdated that sends a regular forkchoice update with no payload

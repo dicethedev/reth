@@ -185,6 +185,8 @@ pub enum BeaconEngineMessage<Payload: PayloadTypes> {
         /// Environment switches: at each `(tx_index, execution_data)`, the executor will
         /// swap the EVM environment to match the given execution data.
         env_switches: Vec<(usize, Payload::ExecutionData)>,
+        /// Real block hashes for blocks covered by previous big blocks in a sequence.
+        prior_block_hashes: Vec<(u64, alloy_primitives::B256)>,
         /// Whether to wait for in-flight persistence to complete before processing.
         wait_for_persistence: bool,
         /// Whether to wait for execution cache and sparse trie locks before processing.
@@ -281,6 +283,7 @@ where
         &self,
         payload: Payload::ExecutionData,
         env_switches: Vec<(usize, Payload::ExecutionData)>,
+        prior_block_hashes: Vec<(u64, alloy_primitives::B256)>,
         wait_for_persistence: bool,
         wait_for_caches: bool,
     ) -> Result<(PayloadStatus, NewPayloadTimings), BeaconOnNewPayloadError> {
@@ -288,6 +291,7 @@ where
         let _ = self.to_engine.send(BeaconEngineMessage::RethNewPayload {
             payload,
             env_switches,
+            prior_block_hashes,
             wait_for_persistence,
             wait_for_caches,
             tx,

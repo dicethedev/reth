@@ -593,6 +593,7 @@ where
         &mut self,
         payload: T::ExecutionData,
         env_switches: Vec<(usize, T::ExecutionData)>,
+        prior_block_hashes: Vec<(u64, B256)>,
     ) -> Result<TreeOutcome<PayloadStatus>, InsertBlockFatalError> {
         trace!(target: "engine::tree", "invoked new payload");
 
@@ -641,7 +642,7 @@ where
         self.metrics.block_validation.record_payload_validation(start.elapsed().as_secs_f64());
 
         let status = if self.backfill_sync_state.is_idle() {
-            self.try_insert_payload(payload, env_switches)?
+            self.try_insert_payload(payload, env_switches, prior_block_hashes)?
         } else {
             self.try_buffer_payload(payload)?
         };
@@ -674,13 +675,14 @@ where
         &mut self,
         payload: T::ExecutionData,
         env_switches: Vec<(usize, T::ExecutionData)>,
+        prior_block_hashes: Vec<(u64, B256)>,
     ) -> Result<PayloadStatus, InsertBlockFatalError> {
         let block_hash = payload.block_hash();
         let num_hash = payload.num_hash();
         let parent_hash = payload.parent_hash();
         let mut latest_valid_hash = None;
 
-        match self.insert_payload(payload, env_switches) {
+        match self.insert_payload(payload, env_switches, prior_block_hashes) {
             Ok(status) => {
                 let status = match status {
                     InsertPayloadOk::Inserted(BlockStatus::Valid) => {
@@ -1519,7 +1521,8 @@ where
                                 let start = Instant::now();
                                 let gas_used = payload.gas_used();
                                 let num_hash = payload.num_hash();
-                                let mut output = self.on_new_payload(payload, Vec::new());
+                                let mut output =
+                                    self.on_new_payload(payload, Vec::new(), Vec::new());
                                 self.metrics.engine.new_payload.update_response_metrics(
                                     start,
                                     &mut self.metrics.engine.forkchoice_updated.latest_finish_at,
@@ -1549,6 +1552,7 @@ where
                             BeaconEngineMessage::RethNewPayload {
                                 payload,
                                 env_switches,
+                                prior_block_hashes,
                                 wait_for_persistence,
                                 wait_for_caches,
                                 tx,
@@ -1597,7 +1601,8 @@ where
                                 let start = Instant::now();
                                 let gas_used = payload.gas_used();
                                 let num_hash = payload.num_hash();
-                                let mut output = self.on_new_payload(payload, env_switches);
+                                let mut output =
+                                    self.on_new_payload(payload, env_switches, prior_block_hashes);
                                 let latency = start.elapsed();
                                 self.metrics.engine.new_payload.update_response_metrics(
                                     start,
@@ -2734,11 +2739,14 @@ where
         &mut self,
         payload: T::ExecutionData,
         env_switches: Vec<(usize, T::ExecutionData)>,
+        prior_block_hashes: Vec<(u64, B256)>,
     ) -> Result<InsertPayloadOk, InsertPayloadError<N::Block>> {
         self.insert_block_or_payload(
             payload.block_with_parent(),
             payload,
-            |validator, payload, ctx| validator.validate_payload(payload, env_switches, ctx),
+            |validator, payload, ctx| {
+                validator.validate_payload(payload, env_switches, prior_block_hashes, ctx)
+            },
             |this, payload| Ok(this.payload_validator.convert_payload_to_block(payload)?),
         )
     }

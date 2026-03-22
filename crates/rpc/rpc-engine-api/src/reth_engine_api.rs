@@ -34,11 +34,13 @@ impl<Payload: PayloadTypes> RethEngineApiServer<Payload::ExecutionData> for Reth
         wait_for_persistence: Option<bool>,
         wait_for_caches: Option<bool>,
         env_switches: Option<Vec<(usize, Payload::ExecutionData)>>,
+        prior_block_hashes: Option<Vec<(u64, alloy_primitives::B256)>>,
     ) -> RpcResult<RethPayloadStatus> {
         let wait_for_persistence = wait_for_persistence.unwrap_or(true);
         let wait_for_caches = wait_for_caches.unwrap_or(true);
         let env_switches = env_switches.unwrap_or_default();
-        tracing::info!(target: "rpc::engine", wait_for_persistence, wait_for_caches, env_switches = env_switches.len(), "Serving reth_newPayload");
+        let prior_block_hashes = prior_block_hashes.unwrap_or_default();
+        tracing::info!(target: "rpc::engine", wait_for_persistence, wait_for_caches, env_switches = env_switches.len(), prior_block_hashes = prior_block_hashes.len(), "Serving reth_newPayload");
 
         let payload = match input {
             RethNewPayloadInput::ExecutionData(data) => data,
@@ -51,7 +53,13 @@ impl<Payload: PayloadTypes> RethEngineApiServer<Payload::ExecutionData> for Reth
 
         let (status, timings) = self
             .beacon_engine_handle
-            .reth_new_payload(payload, env_switches, wait_for_persistence, wait_for_caches)
+            .reth_new_payload(
+                payload,
+                env_switches,
+                prior_block_hashes,
+                wait_for_persistence,
+                wait_for_caches,
+            )
             .await
             .map_err(EngineApiError::from)?;
         Ok(RethPayloadStatus {

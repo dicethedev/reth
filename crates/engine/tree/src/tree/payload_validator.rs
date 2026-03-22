@@ -348,6 +348,7 @@ where
         &mut self,
         input: BlockOrPayload<T>,
         mut env_switches: Vec<(usize, T::ExecutionData)>,
+        prior_block_hashes: Vec<(u64, B256)>,
         mut ctx: TreeCtx<'_, N>,
     ) -> InsertPayloadResult<N>
     where
@@ -461,7 +462,7 @@ where
             let env = debug_span!(target: "engine::tree::payload_validator", "evm_env")
                 .in_scope(|| self.evm_config.evm_env_for_payload(data))
                 .map_err(NewPayloadError::other)?;
-            info!(
+            debug!(
                 target: "engine::tree::payload_validator",
                 "Using initial env_switch data for segment 0 EVM env"
             );
@@ -472,7 +473,7 @@ where
                 .map_err(NewPayloadError::other)?
         };
 
-        info!(
+        debug!(
             target: "engine::tree::payload_validator",
             env_switches_remaining = env_switches.len(),
             has_env_switches,
@@ -574,6 +575,7 @@ where
             &mut handle,
             switch_envs,
             initial_env_data,
+            prior_block_hashes,
         ) {
             Ok(output) => output,
             Err(err) => return self.handle_execution_error(input, err, &parent_block),
@@ -922,6 +924,7 @@ where
         handle: &mut PayloadHandle<impl ExecutableTxFor<Evm>, Err, N::Receipt>,
         switch_envs: Vec<(usize, EvmEnvFor<Evm>, T::ExecutionData)>,
         initial_env_data: Option<T::ExecutionData>,
+        prior_block_hashes: Vec<(u64, B256)>,
     ) -> Result<
         (
             BlockExecutionOutput<N::Receipt>,
@@ -955,6 +958,20 @@ where
                 .with_bundle_update()
                 .build()
         });
+
+        // Seed prior block hashes into the State's block_hashes cache so that
+        // BLOCKHASH opcodes return the correct real hashes for blocks that were
+        // merged into earlier big blocks (and thus not individually persisted).
+        if !prior_block_hashes.is_empty() {
+            debug!(
+                target: "engine::tree::payload_validator",
+                count = prior_block_hashes.len(),
+                "Seeding prior block hashes for BLOCKHASH lookups"
+            );
+            for (block_number, block_hash) in prior_block_hashes {
+                db.block_hashes.insert(block_number, block_hash);
+            }
+        }
 
         // The initial_env_data vec is declared before the executor so it outlives it,
         // allowing the executor to borrow from it for the initial segment's context.
@@ -1097,7 +1114,7 @@ where
             let finished_block_hash = ExecutionPayload::parent_hash(&switch_data_vec[i]);
             reclaimed_db.block_hashes.insert(finished_block_number, finished_block_hash);
 
-            info!(
+            debug!(
                 target: "engine::tree::payload_validator",
                 switch_idx,
                 segment_gas_used = segment_gas,
@@ -1165,7 +1182,7 @@ where
             .in_scope(|| executor.finish())?;
 
         // Aggregate the final segment's results
-        info!(
+        debug!(
             target: "engine::tree::payload_validator",
             final_segment_gas = final_result.gas_used,
             final_segment_receipts = final_result.receipts.len(),
@@ -1196,7 +1213,7 @@ where
             .in_scope(|| db.merge_transitions(BundleRetention::Reverts));
 
         let bundle = db.take_bundle();
-        info!(
+        debug!(
             target: "engine::tree::payload_validator",
             bundle_accounts = bundle.state.len(),
             bundle_contracts = bundle.contracts.len(),
@@ -1652,15 +1669,18 @@ where
         let start = Instant::now();
 
         trace!(target: "engine::tree::payload_validator", block=?block.num_hash(), "Validating block consensus (env_switches mode)");
-        // Skip full header validation (validate_block_inner) for env_switches blocks.
-        // The merged header has aggregated values (gas_limit, gas_used, blob_gas_used)
-        // that exceed single-block limits. Only validate the transaction root if provided.
+        // For env_switches blocks, only validate the transaction root. Skip
+        // validate_block_pre_execution_with_tx_root entirely because it also runs
+        // validate_cancun_gas which checks blob_gas_used — the merged header's
+        // blob_gas_used is the total across all constituent blocks and exceeds
+        // per-block limits.
         if let Some(tx_root) = transaction_root {
-            if let Err(e) =
-                self.consensus.validate_block_pre_execution_with_tx_root(block, Some(tx_root))
-            {
-                error!(target: "engine::tree::payload_validator", ?block, "Failed to validate block {}: {e}", block.hash());
-                return Err(e.into());
+            let expected = block.header().transactions_root();
+            if tx_root != expected {
+                return Err(ConsensusError::BodyTransactionRootDiff(
+                    GotExpected { got: tx_root, expected }.into(),
+                )
+                .into());
             }
         }
 
@@ -2213,6 +2233,7 @@ pub trait EngineValidator<
         &mut self,
         payload: Types::ExecutionData,
         env_switches: Vec<(usize, Types::ExecutionData)>,
+        prior_block_hashes: Vec<(u64, B256)>,
         ctx: TreeCtx<'_, N>,
     ) -> ValidationOutcome<N>;
 
@@ -2273,9 +2294,15 @@ where
         &mut self,
         payload: Types::ExecutionData,
         env_switches: Vec<(usize, Types::ExecutionData)>,
+        prior_block_hashes: Vec<(u64, B256)>,
         ctx: TreeCtx<'_, N>,
     ) -> ValidationOutcome<N> {
-        self.validate_block_with_state(BlockOrPayload::Payload(payload), env_switches, ctx)
+        self.validate_block_with_state(
+            BlockOrPayload::Payload(payload),
+            env_switches,
+            prior_block_hashes,
+            ctx,
+        )
     }
 
     fn validate_block(
@@ -2283,7 +2310,7 @@ where
         block: SealedBlock<N::Block>,
         ctx: TreeCtx<'_, N>,
     ) -> ValidationOutcome<N> {
-        self.validate_block_with_state(BlockOrPayload::Block(block), Vec::new(), ctx)
+        self.validate_block_with_state(BlockOrPayload::Block(block), Vec::new(), Vec::new(), ctx)
     }
 
     fn on_inserted_executed_block(&self, block: ExecutedBlock<N>) {

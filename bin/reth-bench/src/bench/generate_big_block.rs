@@ -199,52 +199,6 @@ pub struct CollectionResult {
     pub next_block: u64,
 }
 
-/// Merges blob versioned hashes from all constituent blocks into the base sidecar
-/// and sums blob_gas_used, so that blob transactions are kept intact and state root
-/// computation produces the correct result.
-fn merge_blob_data(base: &mut ExecutionData, additional_blocks: &[ExecutionData]) {
-    // Collect all versioned hashes: base first, then each additional block in order
-    let mut all_versioned_hashes: Vec<B256> =
-        base.sidecar.cancun().map(|c| c.versioned_hashes.clone()).unwrap_or_default();
-
-    let mut total_blob_gas_used = base.payload.as_v3().map(|v3| v3.blob_gas_used).unwrap_or(0);
-
-    for block_data in additional_blocks {
-        if let Some(cancun) = block_data.sidecar.cancun() {
-            all_versioned_hashes.extend_from_slice(&cancun.versioned_hashes);
-        }
-        if let Some(v3) = block_data.payload.as_v3() {
-            total_blob_gas_used += v3.blob_gas_used;
-        }
-    }
-
-    // Update blob_gas_used to the sum across all blocks
-    if let Some(v3) = base.payload.as_v3_mut() {
-        v3.blob_gas_used = total_blob_gas_used;
-    }
-
-    // Rebuild sidecar with merged versioned_hashes
-    let cancun = base.sidecar.cancun().map(|c| CancunPayloadFields {
-        versioned_hashes: all_versioned_hashes,
-        parent_beacon_block_root: c.parent_beacon_block_root,
-    });
-    let prague = base.sidecar.prague().cloned();
-    base.sidecar = match (cancun, prague) {
-        (Some(c), Some(p)) => ExecutionPayloadSidecar::v4(c, p),
-        (Some(c), None) => ExecutionPayloadSidecar::v3(c),
-        _ => ExecutionPayloadSidecar::none(),
-    };
-
-    if total_blob_gas_used > 0 {
-        info!(
-            target: "reth-bench",
-            total_blob_gas_used,
-            versioned_hashes = base.sidecar.cancun().map(|c| c.versioned_hashes.len()).unwrap_or(0),
-            "Merged blob data from all blocks"
-        );
-    }
-}
-
 /// A merged big block payload with environment switches at block boundaries.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BigBlockPayload {
@@ -258,6 +212,11 @@ pub struct BigBlockPayload {
     /// (basefee, gas_limit, etc.) for segment 0. Without this, segment 0 would
     /// execute with the synthetic merged header's inflated gas_limit.
     pub env_switches: Vec<(usize, ExecutionData)>,
+    /// Block number → real block hash for blocks covered by previous big blocks in a sequence.
+    /// When replaying chained big blocks, the BLOCKHASH opcode needs real hashes for blocks
+    /// that were merged into earlier big blocks (and thus not individually persisted).
+    #[serde(default)]
+    pub prior_block_hashes: Vec<(u64, B256)>,
 }
 
 /// `reth bench generate-big-block` command
@@ -321,6 +280,7 @@ impl Command {
         let provider = RootProvider::<AnyNetwork>::new(client);
 
         let mut prev_big_block_hash: Option<B256> = None;
+        let mut accumulated_block_hashes: Vec<(u64, B256)> = Vec::new();
 
         for big_block_idx in 0..self.num_big_blocks {
             let range_start = self.from_block + big_block_idx * self.count;
@@ -408,24 +368,67 @@ impl Command {
                 base_v1.logs_bloom = final_logs_bloom;
             }
 
-            // Chain sequential big blocks: set parent_hash to the previous big block's hash
+            // Chain sequential big blocks: set parent_hash and block_number for
+            // sequential continuity. The engine's make_canonical walks back from
+            // the new head by decrementing block numbers, so each big block must
+            // have block_number = previous_big_block_number + 1.
             if let Some(prev_hash) = prev_big_block_hash {
                 base.payload.as_v1_mut().parent_hash = prev_hash;
+                // First big block keeps its original block number (range_start).
+                // Subsequent big blocks increment from there.
+                base.payload.as_v1_mut().block_number = self.from_block + big_block_idx;
             }
 
-            // Merge blob versioned hashes from additional blocks into the base sidecar.
-            // Skip env_switch[0] (the base block clone) since its blob data is already
-            // in the base payload — including it would double-count versioned hashes.
-            let additional_blocks: Vec<ExecutionData> =
-                env_switches.iter().skip(1).map(|(_, data)| data.clone()).collect();
-            merge_blob_data(&mut base, &additional_blocks);
+            // Merge blob data from all constituent blocks: sum blob_gas_used
+            // and concatenate versioned hashes so the sidecar matches the blob
+            // transactions in the merged payload body.
+            {
+                let mut all_versioned_hashes: Vec<B256> =
+                    base.sidecar.cancun().map(|c| c.versioned_hashes.clone()).unwrap_or_default();
+                let mut total_blob_gas =
+                    base.payload.as_v3().map(|v3| v3.blob_gas_used).unwrap_or(0);
+                // Skip env_switch[0] (base block clone) to avoid double-counting
+                for (_, switch_data) in env_switches.iter().skip(1) {
+                    if let Some(cancun) = switch_data.sidecar.cancun() {
+                        all_versioned_hashes.extend_from_slice(&cancun.versioned_hashes);
+                    }
+                    if let Some(v3) = switch_data.payload.as_v3() {
+                        total_blob_gas += v3.blob_gas_used;
+                    }
+                }
+                if let Some(v3) = base.payload.as_v3_mut() {
+                    v3.blob_gas_used = total_blob_gas;
+                }
+                let cancun = base.sidecar.cancun().map(|c| CancunPayloadFields {
+                    versioned_hashes: all_versioned_hashes,
+                    parent_beacon_block_root: c.parent_beacon_block_root,
+                });
+                let prague = base.sidecar.prague().cloned();
+                base.sidecar = match (cancun, prague) {
+                    (Some(c), Some(p)) => ExecutionPayloadSidecar::v4(c, p),
+                    (Some(c), None) => ExecutionPayloadSidecar::v3(c),
+                    _ => ExecutionPayloadSidecar::none(),
+                };
+            }
 
             // Compute the real block hash from the mutated payload
             let block_hash = compute_payload_block_hash(&base)?;
             base.payload.as_v1_mut().block_hash = block_hash;
             prev_big_block_hash = Some(block_hash);
 
-            let big_block = BigBlockPayload { execution_data: base, env_switches };
+            let big_block = BigBlockPayload {
+                execution_data: base,
+                env_switches,
+                prior_block_hashes: accumulated_block_hashes.clone(),
+            };
+
+            // Accumulate real block hashes from this big block's env_switches for
+            // subsequent big blocks' BLOCKHASH lookups.
+            for (_, switch_data) in &big_block.env_switches {
+                let block_number = switch_data.payload.as_v1().block_number;
+                let block_hash = switch_data.payload.as_v1().block_hash;
+                accumulated_block_hashes.push((block_number, block_hash));
+            }
 
             // Save to disk
             let range_end = range_start + self.count - 1;
@@ -442,6 +445,7 @@ impl Command {
                 total_txs = big_block.execution_data.payload.transactions().len(),
                 total_gas_used = big_block.execution_data.payload.as_v1().gas_used,
                 env_switches = big_block.env_switches.len(),
+                prior_block_hashes = big_block.prior_block_hashes.len(),
                 "Big block payload saved"
             );
         }
