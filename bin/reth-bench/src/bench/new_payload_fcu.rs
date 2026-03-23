@@ -18,7 +18,7 @@ use alloy_provider::{ext::DebugApi, Provider};
 use alloy_rpc_types_engine::ForkchoiceState;
 use clap::Parser;
 use eyre::{Context, OptionExt};
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{stream, StreamExt};
 use reth_cli_runner::CliContext;
 use reth_engine_primitives::config::DEFAULT_PERSISTENCE_THRESHOLD;
 use reth_node_core::args::BenchmarkArgs;
@@ -111,83 +111,95 @@ impl Command {
 
         let buffer_size = self.rpc_block_buffer_size;
 
-        let mut blocks = Box::pin(
-            stream::iter((next_block..)
-                .take_while(|next_block| {
-                    benchmark_mode.contains(*next_block)
-                }))
-                .map(|next_block| {
-                    let block_provider = block_provider.clone();
-                    async move {
-                        let block_res = block_provider
-                            .get_block_by_number(next_block.into())
-                            .full()
+        // Spawn a task that drives a `.buffered()` stream and sends fetched blocks
+        // through a channel. This decouples fetching from consumption: up to
+        // `buffer_size` block fetches run concurrently, and the channel keeps
+        // completed blocks ready for the consumer even while it is busy processing
+        // the previous block (calling newPayload + FCU).
+        let (block_tx, mut block_rx) = tokio::sync::mpsc::channel(buffer_size);
+        tokio::task::spawn(async move {
+            let mut blocks = stream::iter(
+                (next_block..).take_while(|n| benchmark_mode.contains(*n)),
+            )
+            .map(|next_block| {
+                let block_provider = block_provider.clone();
+                async move {
+                    let block_res = block_provider
+                        .get_block_by_number(next_block.into())
+                        .full()
+                        .await
+                        .wrap_err_with(|| {
+                            format!("Failed to fetch block by number {next_block}")
+                        });
+                    let block =
+                        match block_res.and_then(|opt| opt.ok_or_eyre("Block not found")) {
+                            Ok(block) => block,
+                            Err(e) => {
+                                tracing::error!(target: "reth-bench", "Failed to fetch block {next_block}: {e}");
+                                return Err(e)
+                            }
+                        };
+
+                    let rlp = if rlp_blocks {
+                        let rlp = match block_provider
+                            .debug_get_raw_block(next_block.into())
                             .await
-                            .wrap_err_with(|| {
-                                format!("Failed to fetch block by number {next_block}")
-                            });
-                        let block =
-                            match block_res.and_then(|opt| opt.ok_or_eyre("Block not found")) {
-                                Ok(block) => block,
-                                Err(e) => {
-                                    tracing::error!(target: "reth-bench", "Failed to fetch block {next_block}: {e}");
-                                    return Err(e)
-                                }
-                            };
-
-                        let rlp = if rlp_blocks {
-                            let rlp = match block_provider
-                                .debug_get_raw_block(next_block.into())
-                                .await
-                            {
-                                Ok(rlp) => rlp,
-                                Err(e) => {
-                                    tracing::error!(target: "reth-bench", "Failed to fetch raw block {next_block}: {e}");
-                                    return Err(e.into())
-                                }
-                            };
-                            Some(rlp)
-                        } else {
-                            None
+                        {
+                            Ok(rlp) => rlp,
+                            Err(e) => {
+                                tracing::error!(target: "reth-bench", "Failed to fetch raw block {next_block}: {e}");
+                                return Err(e.into())
+                            }
                         };
+                        Some(rlp)
+                    } else {
+                        None
+                    };
 
-                        let head_block_hash = block.header.hash;
-                        let safe_block_hash = block_provider
-                            .get_block_by_number(block.header.number.saturating_sub(32).into());
+                    let head_block_hash = block.header.hash;
+                    let safe_block_hash = block_provider
+                        .get_block_by_number(block.header.number.saturating_sub(32).into());
 
-                        let finalized_block_hash = block_provider
-                            .get_block_by_number(block.header.number.saturating_sub(64).into());
+                    let finalized_block_hash = block_provider
+                        .get_block_by_number(block.header.number.saturating_sub(64).into());
 
-                        let (safe, finalized) =
-                            tokio::join!(safe_block_hash, finalized_block_hash);
+                    let (safe, finalized) =
+                        tokio::join!(safe_block_hash, finalized_block_hash);
 
-                        let safe_block_hash = match safe {
-                            Ok(Some(block)) => block.header.hash,
-                            Ok(None) | Err(_) => head_block_hash,
-                        };
+                    let safe_block_hash = match safe {
+                        Ok(Some(block)) => block.header.hash,
+                        Ok(None) | Err(_) => head_block_hash,
+                    };
 
-                        let finalized_block_hash = match finalized {
-                            Ok(Some(block)) => block.header.hash,
-                            Ok(None) | Err(_) => head_block_hash,
-                        };
+                    let finalized_block_hash = match finalized {
+                        Ok(Some(block)) => block.header.hash,
+                        Ok(None) | Err(_) => head_block_hash,
+                    };
 
-                        Ok((block, head_block_hash, safe_block_hash, finalized_block_hash, rlp))
-                    }
-                })
-                .buffered(buffer_size),
-        );
+                    Ok((block, head_block_hash, safe_block_hash, finalized_block_hash, rlp))
+                }
+            })
+            .buffered(buffer_size);
+
+            while let Some(result) = blocks.next().await {
+                if block_tx.send(result).await.is_err() {
+                    break;
+                }
+            }
+        });
 
         let mut results = Vec::new();
         let mut blocks_processed = 0u64;
         let total_benchmark_duration = Instant::now();
         let mut total_wait_time = Duration::ZERO;
 
-        while let Some((block, head, safe, finalized, rlp)) = {
+        while let Some(block_result) = {
             let wait_start = Instant::now();
-            let result = blocks.try_next().await?;
+            let result = block_rx.recv().await;
             total_wait_time += wait_start.elapsed();
             result
         } {
+            let (block, head, safe, finalized, rlp) = block_result?;
             let gas_used = block.header.gas_used;
             let gas_limit = block.header.gas_limit;
             let block_number = block.header.number;
