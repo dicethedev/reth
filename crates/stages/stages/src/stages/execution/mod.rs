@@ -273,8 +273,7 @@ where
         + StateWriter<Receipt = <E::Primitives as NodePrimitives>::Receipt>
         + StorageSettingsCache
         + StoragePath
-        + ChainSpecProvider<ChainSpec: EthereumHardforks>
-        + Sync,
+        + ChainSpecProvider<ChainSpec: EthereumHardforks>,
 {
     /// Return the id of the stage
     fn id(&self) -> StageId {
@@ -492,18 +491,17 @@ where
         // plain account/storage tables and only writes bytecodes and changesets. The hashed
         // state is then written separately below.
         if provider.cached_storage_settings().use_hashed_state() {
-            let (hashed_state, write_result) = rayon::join(
-                || state.hash_state_slow::<KeccakKeyHasher>().into_sorted(),
-                || {
-                    provider.write_state(
-                        &state,
-                        OriginalValuesKnown::Yes,
-                        StateWriteConfig::default(),
-                    )
-                },
-            );
-            write_result?;
-            provider.write_hashed_state(&hashed_state)?;
+            let hashed_state = std::thread::scope(|s| {
+                let handle = s.spawn(|| state.hash_state_slow::<KeccakKeyHasher>().into_sorted());
+                let write_result = provider.write_state(
+                    &state,
+                    OriginalValuesKnown::Yes,
+                    StateWriteConfig::default(),
+                );
+                (handle.join().expect("hash_state_slow panicked"), write_result)
+            });
+            hashed_state.1?;
+            provider.write_hashed_state(&hashed_state.0)?;
         } else {
             provider.write_state(&state, OriginalValuesKnown::Yes, StateWriteConfig::default())?;
         }
