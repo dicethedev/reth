@@ -72,7 +72,7 @@ pub use cached_state::{CachedStateMetrics, CachedStateProvider, ExecutionCache, 
 pub use invalid_headers::InvalidHeaderCache;
 pub use metrics::EngineApiMetrics;
 pub use payload_processor::*;
-pub use payload_validator::{BasicEngineValidator, EngineValidator};
+pub use payload_validator::{AdjustCumulativeGas, BasicEngineValidator, EngineValidator};
 pub use persistence_state::PersistenceState;
 pub use reth_engine_primitives::TreeConfig;
 

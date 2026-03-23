@@ -47,6 +47,8 @@ pub struct EthBeaconConsensus<ChainSpec> {
     skip_gas_limit_ramp_check: bool,
     /// When set, overrides `max_blob_count` in `BlobParams` during EIP-4844 validation.
     max_blob_count_override: Option<u64>,
+    /// When true, skips validation of the `requests_hash` header field (EIP-7685).
+    skip_requests_hash_check: bool,
 }
 
 impl<ChainSpec: EthChainSpec + EthereumHardforks> EthBeaconConsensus<ChainSpec> {
@@ -57,6 +59,7 @@ impl<ChainSpec: EthChainSpec + EthereumHardforks> EthBeaconConsensus<ChainSpec> 
             max_extra_data_size: MAXIMUM_EXTRA_DATA_SIZE,
             skip_gas_limit_ramp_check: false,
             max_blob_count_override: None,
+            skip_requests_hash_check: false,
         }
     }
 
@@ -83,6 +86,12 @@ impl<ChainSpec: EthChainSpec + EthereumHardforks> EthBeaconConsensus<ChainSpec> 
         self
     }
 
+    /// Disables validation of the `requests_hash` header field (EIP-7685).
+    pub const fn with_skip_requests_hash_check(mut self, skip: bool) -> Self {
+        self.skip_requests_hash_check = skip;
+        self
+    }
+
     /// Returns the chain spec associated with this consensus engine.
     pub const fn chain_spec(&self) -> &Arc<ChainSpec> {
         &self.chain_spec
@@ -106,6 +115,7 @@ where
             &result.receipts,
             &result.requests,
             receipt_root_bloom,
+            self.skip_requests_hash_check,
         )
     }
 }

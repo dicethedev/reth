@@ -665,6 +665,15 @@ pub struct RpcServerArgs {
     #[arg(long = "testing.max-blob-count", value_name = "COUNT", hide = true)]
     pub testing_max_blob_count: Option<u64>,
 
+    /// Skip validation of the `requests_hash` header field (EIP-7685).
+    ///
+    /// When enabled, consensus will not compare the accumulated execution layer
+    /// requests hash against the block header's `requests_hash`. This is useful
+    /// for big block payloads where the generator cannot compute the correct
+    /// merged `requests_hash` from RPC data alone.
+    #[arg(long = "testing.skip-requests-hash-check", default_value_t = false, hide = true)]
+    pub testing_skip_requests_hash_check: bool,
+
     /// Override the gas limit used by `testing_buildBlockV1`.
     ///
     /// When set, `testing_buildBlockV1` will use this value instead of inheriting
@@ -913,6 +922,7 @@ impl Default for RpcServerArgs {
             testing_skip_invalid_transactions: true,
             testing_skip_gas_limit_ramp_check: false,
             testing_max_blob_count: None,
+            testing_skip_requests_hash_check: false,
             testing_gas_limit: None,
             rpc_force_blob_sidecar_upcasting: false,
         }
@@ -1093,6 +1103,7 @@ mod tests {
             testing_skip_invalid_transactions: true,
             testing_skip_gas_limit_ramp_check: false,
             testing_max_blob_count: None,
+            testing_skip_requests_hash_check: false,
             testing_gas_limit: None,
             rpc_force_blob_sidecar_upcasting: false,
         };
