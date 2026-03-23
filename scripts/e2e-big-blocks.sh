@@ -200,6 +200,7 @@ rm -f "$DATADIR/db/mdbx.lck" "$DATADIR/db/lock" "$DATADIR/static_files/lock"
     --datadir "$DATADIR" \
     --chain "$CHAIN" \
     --testing.skip-gas-limit-ramp-check \
+    --testing.skip-requests-hash-check \
     --testing.gas-limit 300000000000 \
     --testing.max-blob-count 10000 \
     --http --http.api debug,eth \
