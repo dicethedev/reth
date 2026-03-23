@@ -273,7 +273,8 @@ where
         + StateWriter<Receipt = <E::Primitives as NodePrimitives>::Receipt>
         + StorageSettingsCache
         + StoragePath
-        + ChainSpecProvider<ChainSpec: EthereumHardforks>,
+        + ChainSpecProvider<ChainSpec: EthereumHardforks>
+        + Sync,
 {
     /// Return the id of the stage
     fn id(&self) -> StageId {
@@ -490,11 +491,24 @@ where
         // Write output. When `use_hashed_state` is enabled, `write_state` skips writing to
         // plain account/storage tables and only writes bytecodes and changesets. The hashed
         // state is then written separately below.
-        provider.write_state(&state, OriginalValuesKnown::Yes, StateWriteConfig::default())?;
-
+        //
+        // `hash_state_slow` is CPU-bound and independent of `write_state` (IO-bound), so we
+        // run them in parallel when hashed state is enabled.
         if provider.cached_storage_settings().use_hashed_state() {
-            let hashed_state = state.hash_state_slow::<KeccakKeyHasher>();
+            let (hashed_state, write_result) = rayon::join(
+                || state.hash_state_slow::<KeccakKeyHasher>(),
+                || {
+                    provider.write_state(
+                        &state,
+                        OriginalValuesKnown::Yes,
+                        StateWriteConfig::default(),
+                    )
+                },
+            );
+            write_result?;
             provider.write_hashed_state(&hashed_state.into_sorted())?;
+        } else {
+            provider.write_state(&state, OriginalValuesKnown::Yes, StateWriteConfig::default())?;
         }
 
         let db_write_duration = time.elapsed();
