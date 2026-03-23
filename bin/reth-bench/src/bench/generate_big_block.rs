@@ -5,7 +5,7 @@
 //! [`BigBlockPayload`] JSON file containing the merged [`ExecutionData`] and environment switches
 //! at each block boundary.
 
-use alloy_eips::Typed2718;
+use alloy_eips::{eip1559::BaseFeeParams, eip7840::BlobParams, Typed2718};
 use alloy_primitives::{Bytes, B256};
 use alloy_provider::{network::AnyNetwork, Provider, RootProvider};
 use alloy_rpc_client::ClientBuilder;
@@ -14,8 +14,11 @@ use alloy_rpc_types_engine::{
 };
 use clap::Parser;
 use eyre::Context;
+use reth_chainspec::EthChainSpec;
+use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_runner::CliContext;
 use reth_engine_primitives::BigBlockData;
+use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use tracing::info;
@@ -220,6 +223,10 @@ pub struct Command {
     #[arg(long, value_name = "RPC_URL")]
     rpc_url: String,
 
+    /// The chain name or path to a chain spec JSON file.
+    #[arg(long, value_name = "CHAIN", default_value = "mainnet")]
+    chain: String,
+
     /// Block number to start from.
     #[arg(long, value_name = "FROM_BLOCK")]
     from_block: u64,
@@ -250,11 +257,16 @@ impl Command {
             return Err(eyre::eyre!("--num-big-blocks must be at least 1"));
         }
 
+        // Resolve chain spec for blob params lookup
+        let chain_spec = EthereumChainSpecParser::parse(&self.chain)
+            .wrap_err_with(|| format!("Failed to parse chain spec: {}", self.chain))?;
+
         info!(
             target: "reth-bench",
             from_block = self.from_block,
             count = self.count,
             num_big_blocks = self.num_big_blocks,
+            chain = %chain_spec.chain(),
             output_dir = %self.output_dir.display(),
             "Generating big block payloads"
         );
@@ -272,6 +284,17 @@ impl Command {
 
         let mut prev_big_block_hash: Option<B256> = None;
         let mut accumulated_block_hashes: Vec<(u64, B256)> = Vec::new();
+
+        // Track previous big block's merged header fields for deriving basefee and
+        // excess_blob_gas on subsequent big blocks.
+        struct PrevBigBlockHeader {
+            gas_used: u64,
+            gas_limit: u64,
+            base_fee_per_gas: u64,
+            blob_gas_used: u64,
+            excess_blob_gas: u64,
+        }
+        let mut prev_big_block_header: Option<PrevBigBlockHeader> = None;
 
         for big_block_idx in 0..self.num_big_blocks {
             let range_start = self.from_block + big_block_idx * self.count;
@@ -359,15 +382,42 @@ impl Command {
                 base_v1.logs_bloom = final_logs_bloom;
             }
 
-            // Chain sequential big blocks: set parent_hash and block_number for
-            // sequential continuity. The engine's make_canonical walks back from
-            // the new head by decrementing block numbers, so each big block must
-            // have block_number = previous_big_block_number + 1.
+            // Chain sequential big blocks: set parent_hash, block_number, basefee,
+            // and excess_blob_gas for sequential continuity. The engine validates
+            // each big block against its parent, so these fields must be
+            // derivable from the previous big block's merged header.
             if let Some(prev_hash) = prev_big_block_hash {
                 base.payload.as_v1_mut().parent_hash = prev_hash;
                 // First big block keeps its original block number (range_start).
                 // Subsequent big blocks increment from there.
                 base.payload.as_v1_mut().block_number = self.from_block + big_block_idx;
+            }
+            if let Some(prev) = &prev_big_block_header {
+                // Derive basefee from the previous big block's merged header using
+                // the standard EIP-1559 formula so validate_against_parent_eip1559_base_fee passes.
+                let next_base_fee = alloy_eips::calc_next_block_base_fee(
+                    prev.gas_used,
+                    prev.gas_limit,
+                    prev.base_fee_per_gas,
+                    BaseFeeParams::ethereum(),
+                );
+                base.payload.as_v1_mut().base_fee_per_gas =
+                    alloy_primitives::U256::from(next_base_fee);
+
+                // Derive excess_blob_gas from the previous big block's merged header
+                // so validate_against_parent_4844 passes.
+                let timestamp = base.payload.as_v1().timestamp;
+                let blob_params = chain_spec
+                    .blob_params_at_timestamp(timestamp)
+                    .unwrap_or_else(BlobParams::cancun);
+                let next_excess_blob_gas = blob_params.next_block_excess_blob_gas_osaka(
+                    prev.excess_blob_gas,
+                    prev.blob_gas_used,
+                    prev.base_fee_per_gas,
+                );
+                if let Some(v3) = base.payload.as_v3_mut() {
+                    v3.excess_blob_gas = next_excess_blob_gas;
+                }
             }
 
             // Merge blob data from all constituent blocks: sum blob_gas_used
@@ -406,6 +456,19 @@ impl Command {
             let block_hash = compute_payload_block_hash(&base)?;
             base.payload.as_v1_mut().block_hash = block_hash;
             prev_big_block_hash = Some(block_hash);
+
+            // Record this big block's merged header fields so the next big block
+            // can derive its basefee and excess_blob_gas correctly.
+            {
+                let v1 = base.payload.as_v1();
+                prev_big_block_header = Some(PrevBigBlockHeader {
+                    gas_used: v1.gas_used,
+                    gas_limit: v1.gas_limit,
+                    base_fee_per_gas: v1.base_fee_per_gas.to::<u64>(),
+                    blob_gas_used: base.payload.as_v3().map(|v3| v3.blob_gas_used).unwrap_or(0),
+                    excess_blob_gas: base.payload.as_v3().map(|v3| v3.excess_blob_gas).unwrap_or(0),
+                });
+            }
 
             let big_block = BigBlockPayload {
                 execution_data: base,

@@ -45,6 +45,8 @@ pub struct EthBeaconConsensus<ChainSpec> {
     max_extra_data_size: usize,
     /// When true, skips the gas limit change validation between parent and child blocks.
     skip_gas_limit_ramp_check: bool,
+    /// When set, overrides `max_blob_count` in `BlobParams` during EIP-4844 validation.
+    max_blob_count_override: Option<u64>,
 }
 
 impl<ChainSpec: EthChainSpec + EthereumHardforks> EthBeaconConsensus<ChainSpec> {
@@ -54,6 +56,7 @@ impl<ChainSpec: EthChainSpec + EthereumHardforks> EthBeaconConsensus<ChainSpec> 
             chain_spec,
             max_extra_data_size: MAXIMUM_EXTRA_DATA_SIZE,
             skip_gas_limit_ramp_check: false,
+            max_blob_count_override: None,
         }
     }
 
@@ -71,6 +74,12 @@ impl<ChainSpec: EthChainSpec + EthereumHardforks> EthBeaconConsensus<ChainSpec> 
     /// Disables the gas limit change validation between parent and child blocks.
     pub const fn with_skip_gas_limit_ramp_check(mut self, skip: bool) -> Self {
         self.skip_gas_limit_ramp_check = skip;
+        self
+    }
+
+    /// Overrides the `max_blob_count` in `BlobParams` during EIP-4844 header validation.
+    pub const fn with_max_blob_count(mut self, max_blob_count: Option<u64>) -> Self {
+        self.max_blob_count_override = max_blob_count;
         self
     }
 
@@ -183,12 +192,14 @@ where
 
         // Ensures that EIP-4844 fields are valid once cancun is active.
         if self.chain_spec.is_cancun_active_at_timestamp(header.timestamp()) {
-            validate_4844_header_standalone(
-                header,
-                self.chain_spec
-                    .blob_params_at_timestamp(header.timestamp())
-                    .unwrap_or_else(BlobParams::cancun),
-            )?;
+            let mut blob_params = self
+                .chain_spec
+                .blob_params_at_timestamp(header.timestamp())
+                .unwrap_or_else(BlobParams::cancun);
+            if let Some(max_blob_count) = self.max_blob_count_override {
+                blob_params.max_blob_count = max_blob_count;
+            }
+            validate_4844_header_standalone(header, blob_params)?;
         } else if header.blob_gas_used().is_some() {
             return Err(ConsensusError::BlobGasUsedUnexpected)
         } else if header.excess_blob_gas().is_some() {

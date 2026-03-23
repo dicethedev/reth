@@ -1687,9 +1687,19 @@ where
             }
         }
 
-        // Skip validate_header_against_parent for env_switch blocks - the merged
-        // big block may span multiple real block numbers, so parent number checks
-        // would fail.
+        // Validate against the parent — the big block generator sets parent_hash,
+        // block_number, basefee, and excess_blob_gas on the outer block correctly
+        // so these checks pass. The gas limit ramp check is skipped via
+        // --testing.skip-gas-limit-ramp-check.
+        {
+            let _enter = debug_span!(target: "engine::tree::payload_validator", "validate_header_against_parent").entered();
+            if let Err(e) =
+                self.consensus.validate_header_against_parent(block.sealed_header(), parent_block)
+            {
+                warn!(target: "engine::tree::payload_validator", ?block, "Failed to validate header {} against parent: {e}", block.hash());
+                return Err(e.into())
+            }
+        }
 
         // Skip validate_block_post_execution - gas_used, receipts_root, logs_bloom
         // are expected to diverge for merged env_switch blocks

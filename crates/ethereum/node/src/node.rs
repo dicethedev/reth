@@ -569,7 +569,8 @@ where
     async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
         Ok(Arc::new(
             EthBeaconConsensus::new(ctx.chain_spec())
-                .with_skip_gas_limit_ramp_check(ctx.config().rpc.testing_skip_gas_limit_ramp_check),
+                .with_skip_gas_limit_ramp_check(ctx.config().rpc.testing_skip_gas_limit_ramp_check)
+                .with_max_blob_count(ctx.config().rpc.testing_max_blob_count),
         ))
     }
 }
