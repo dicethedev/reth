@@ -3,41 +3,35 @@
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
 
+mod engine_validator;
+
 use alloy_primitives::B256;
-use alloy_rlp::Decodable;
-use alloy_rpc_types::engine::{
-    ExecutionData, ForkchoiceState, ForkchoiceUpdated, PayloadAttributes as EthPayloadAttributes,
-};
+
+use alloy_rpc_types::engine::{ExecutionData, ForkchoiceState, ForkchoiceUpdated};
 use async_trait::async_trait;
 use clap::Parser;
+use engine_validator::{BbEngineValidatorBuilder, BigBlockData};
 use jsonrpsee::core::RpcResult;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks, Hardforks};
-use reth_engine_primitives::{
-    BigBlockData, BlockExecutionPlan, ConsensusEngineHandle, EngineApiValidator, ExecutionPlanExt,
-    ExecutionSegment, PayloadValidator,
-};
+use reth_engine_primitives::ConsensusEngineHandle;
 use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
 use reth_ethereum_consensus::EthBeaconConsensus;
 use reth_ethereum_primitives::EthPrimitives;
-use reth_node_api::{AddOnsContext, EngineTypes, FullNodeComponents, NodeTypes, PayloadTypes};
+use reth_node_api::{AddOnsContext, FullNodeComponents, NodeTypes, PayloadTypes};
 use reth_node_builder::{
     components::{BasicPayloadServiceBuilder, ComponentsBuilder, ConsensusBuilder},
     node::FullNodeTypes,
     rpc::{
-        BasicEngineApiBuilder, BasicEngineValidatorBuilder, EngineApiBuilder, EngineValidatorAddOn,
-        EngineValidatorBuilder, PayloadValidatorBuilder, RethRpcAddOns, RpcAddOns, RpcHandle,
-        RpcHooks,
+        BasicEngineApiBuilder, EngineApiBuilder, EngineValidatorAddOn, EngineValidatorBuilder,
+        PayloadValidatorBuilder, RethRpcAddOns, RpcAddOns, RpcHandle, RpcHooks,
     },
     BuilderContext, Node,
 };
 use reth_node_ethereum::{
-    EthEngineTypes, EthereumEthApiBuilder, EthereumExecutorBuilder, EthereumNetworkBuilder,
-    EthereumNode, EthereumPayloadBuilder, EthereumPoolBuilder,
+    EthEngineTypes, EthereumEngineValidatorBuilder, EthereumEthApiBuilder, EthereumExecutorBuilder,
+    EthereumNetworkBuilder, EthereumNode, EthereumPayloadBuilder, EthereumPoolBuilder,
 };
-use reth_payload_primitives::{
-    EngineApiMessageVersion, EngineObjectValidationError, InvalidPayloadAttributesError,
-    NewPayloadError, PayloadOrAttributes,
-};
+use reth_payload_primitives::{EngineApiMessageVersion, ExecutionPayload};
 use reth_primitives_traits::SealedBlock;
 use reth_provider::EthStorage;
 use reth_rpc_api::{RethNewPayloadInput, RethPayloadStatus};
@@ -49,7 +43,7 @@ use std::{
 use tracing::{info, trace};
 
 /// Shared map for big block data, keyed by payload hash.
-type BigBlockMap = Arc<Mutex<HashMap<B256, BigBlockData<ExecutionData>>>>;
+pub type BigBlockMap = Arc<Mutex<HashMap<B256, BigBlockData<ExecutionData>>>>;
 
 // ---------------------------------------------------------------------------
 // Custom RPC trait for big-block payloads
@@ -110,14 +104,14 @@ impl BbRethEngineApiServer for BbRethEngineApiHandler {
         let payload = match input {
             RethNewPayloadInput::ExecutionData(data) => data,
             RethNewPayloadInput::BlockRlp(rlp) => {
-                let block = Decodable::decode(&mut rlp.as_ref())
+                let block = alloy_rlp::Decodable::decode(&mut rlp.as_ref())
                     .map_err(|err| EngineApiError::Internal(Box::new(err)))?;
                 <EthEngineTypes as PayloadTypes>::block_to_payload(SealedBlock::new_unhashed(block))
             }
         };
 
         if let Some(data) = big_block_data {
-            let hash = reth_payload_primitives::ExecutionPayload::block_hash(&payload);
+            let hash = ExecutionPayload::block_hash(&payload);
             self.pending.lock().unwrap().insert(hash, data);
         }
 
@@ -149,133 +143,6 @@ impl BbRethEngineApiServer for BbRethEngineApiHandler {
 }
 
 // ---------------------------------------------------------------------------
-// Payload validator wrapper (stores big block data, converts to execution plans)
-// ---------------------------------------------------------------------------
-
-/// Payload validator wrapper that stores big block data and converts it to execution plans.
-#[derive(Debug, Clone)]
-pub struct BbPayloadValidator<V> {
-    inner: V,
-    pending: BigBlockMap,
-}
-
-impl<V, Types> PayloadValidator<Types> for BbPayloadValidator<V>
-where
-    V: PayloadValidator<Types>,
-    Types: PayloadTypes<ExecutionData = ExecutionData>,
-{
-    type Block = V::Block;
-
-    fn convert_payload_to_block(
-        &self,
-        payload: Types::ExecutionData,
-    ) -> Result<SealedBlock<Self::Block>, NewPayloadError> {
-        self.inner.convert_payload_to_block(payload)
-    }
-
-    fn validate_payload_attributes_against_header(
-        &self,
-        attr: &Types::PayloadAttributes,
-        header: &<Self::Block as reth_primitives_traits::Block>::Header,
-    ) -> Result<(), InvalidPayloadAttributesError> {
-        self.inner.validate_payload_attributes_against_header(attr, header)
-    }
-}
-
-impl<V, Types> EngineApiValidator<Types> for BbPayloadValidator<V>
-where
-    V: EngineApiValidator<Types>,
-    Types: PayloadTypes<ExecutionData = ExecutionData>,
-{
-    fn validate_version_specific_fields(
-        &self,
-        version: EngineApiMessageVersion,
-        payload_or_attrs: PayloadOrAttributes<'_, Types::ExecutionData, Types::PayloadAttributes>,
-    ) -> Result<(), EngineObjectValidationError> {
-        self.inner.validate_version_specific_fields(version, payload_or_attrs)
-    }
-
-    fn ensure_well_formed_attributes(
-        &self,
-        version: EngineApiMessageVersion,
-        attributes: &Types::PayloadAttributes,
-    ) -> Result<(), EngineObjectValidationError> {
-        self.inner.ensure_well_formed_attributes(version, attributes)
-    }
-}
-
-impl<V> ExecutionPlanExt<ExecutionData> for BbPayloadValidator<V>
-where
-    V: Send + Sync,
-{
-    fn take_execution_plan(&mut self, payload_hash: B256) -> BlockExecutionPlan<ExecutionData> {
-        let big_block_data = self.pending.lock().unwrap().remove(&payload_hash);
-        let Some(data) = big_block_data else {
-            return BlockExecutionPlan::single();
-        };
-
-        let mut env_switches = data.env_switches;
-
-        let initial_execution_data = if env_switches.first().is_some_and(|(idx, _)| *idx == 0) {
-            Some(env_switches.remove(0).1)
-        } else {
-            None
-        };
-
-        let segments = env_switches
-            .into_iter()
-            .map(|(tx_idx, exec_data)| ExecutionSegment {
-                stop_before_tx: tx_idx,
-                execution_data: exec_data,
-            })
-            .collect();
-
-        BlockExecutionPlan {
-            initial_execution_data,
-            seed_block_hashes: data.prior_block_hashes,
-            segments,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Payload validator builder
-// ---------------------------------------------------------------------------
-
-/// Builder for [`BbPayloadValidator`].
-#[derive(Debug, Clone)]
-pub struct BbPayloadValidatorBuilder {
-    pending: BigBlockMap,
-}
-
-impl BbPayloadValidatorBuilder {
-    fn new(pending: BigBlockMap) -> Self {
-        Self { pending }
-    }
-}
-
-impl<Node, Types> PayloadValidatorBuilder<Node> for BbPayloadValidatorBuilder
-where
-    Types: NodeTypes<
-        ChainSpec: Hardforks + EthereumHardforks + Clone + 'static,
-        Payload: EngineTypes<ExecutionData = ExecutionData>
-                     + PayloadTypes<PayloadAttributes = EthPayloadAttributes>,
-        Primitives = EthPrimitives,
-    >,
-    Node: FullNodeComponents<Types = Types>,
-{
-    type Validator =
-        BbPayloadValidator<reth_node_ethereum::EthereumEngineValidator<Types::ChainSpec>>;
-
-    async fn build(self, ctx: &AddOnsContext<'_, Node>) -> eyre::Result<Self::Validator> {
-        Ok(BbPayloadValidator {
-            inner: reth_node_ethereum::EthereumEngineValidator::new(ctx.config.chain.clone()),
-            pending: self.pending.clone(),
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Node add-ons wrapper
 // ---------------------------------------------------------------------------
 
@@ -298,19 +165,18 @@ impl BbAddOns {
     ) -> RpcAddOns<
         N,
         EthereumEthApiBuilder,
-        BbPayloadValidatorBuilder,
-        BasicEngineApiBuilder<BbPayloadValidatorBuilder>,
-        BasicEngineValidatorBuilder<BbPayloadValidatorBuilder>,
+        EthereumEngineValidatorBuilder,
+        BasicEngineApiBuilder<EthereumEngineValidatorBuilder>,
+        BbEngineValidatorBuilder<EthereumEngineValidatorBuilder>,
     >
     where
         EthereumEthApiBuilder: reth_node_builder::rpc::EthApiBuilder<N>,
     {
-        let pvb = BbPayloadValidatorBuilder::new(self.pending.clone());
         RpcAddOns::new(
             EthereumEthApiBuilder::default(),
-            pvb.clone(),
-            BasicEngineApiBuilder { payload_validator_builder: pvb.clone() },
-            BasicEngineValidatorBuilder::new(pvb),
+            EthereumEngineValidatorBuilder::default(),
+            BasicEngineApiBuilder::default(),
+            BbEngineValidatorBuilder::new(self.pending.clone()),
             Default::default(),
         )
     }
@@ -326,9 +192,9 @@ where
         >,
     >,
     EthereumEthApiBuilder: reth_node_builder::rpc::EthApiBuilder<N>,
-    BbPayloadValidatorBuilder: PayloadValidatorBuilder<N>,
-    BasicEngineApiBuilder<BbPayloadValidatorBuilder>: EngineApiBuilder<N>,
-    BasicEngineValidatorBuilder<BbPayloadValidatorBuilder>: EngineValidatorBuilder<N>,
+    EthereumEngineValidatorBuilder: PayloadValidatorBuilder<N>,
+    BasicEngineApiBuilder<EthereumEngineValidatorBuilder>: EngineApiBuilder<N>,
+    BbEngineValidatorBuilder<EthereumEngineValidatorBuilder>: EngineValidatorBuilder<N>,
 {
     type Handle =
         RpcHandle<N, <EthereumEthApiBuilder as reth_node_builder::rpc::EthApiBuilder<N>>::EthApi>;
@@ -359,15 +225,13 @@ where
         >,
     >,
     EthereumEthApiBuilder: reth_node_builder::rpc::EthApiBuilder<N>,
-    BbPayloadValidatorBuilder: PayloadValidatorBuilder<N>,
-    BasicEngineApiBuilder<BbPayloadValidatorBuilder>: EngineApiBuilder<N>,
-    BasicEngineValidatorBuilder<BbPayloadValidatorBuilder>: EngineValidatorBuilder<N>,
+    EthereumEngineValidatorBuilder: PayloadValidatorBuilder<N>,
+    BasicEngineApiBuilder<EthereumEngineValidatorBuilder>: EngineApiBuilder<N>,
+    BbEngineValidatorBuilder<EthereumEngineValidatorBuilder>: EngineValidatorBuilder<N>,
 {
     type EthApi = <EthereumEthApiBuilder as reth_node_builder::rpc::EthApiBuilder<N>>::EthApi;
 
     fn hooks_mut(&mut self) -> &mut RpcHooks<N, Self::EthApi> {
-        // BbAddOns doesn't support hooks — they are created at launch time.
-        // This is a limitation; hooks should be set via the ext closure instead.
         unimplemented!("BbAddOns does not support dynamic hook mutation")
     }
 }
@@ -375,13 +239,12 @@ where
 impl<N> EngineValidatorAddOn<N> for BbAddOns
 where
     N: FullNodeComponents,
-    BasicEngineValidatorBuilder<BbPayloadValidatorBuilder>: EngineValidatorBuilder<N>,
+    BbEngineValidatorBuilder<EthereumEngineValidatorBuilder>: EngineValidatorBuilder<N>,
 {
-    type ValidatorBuilder = BasicEngineValidatorBuilder<BbPayloadValidatorBuilder>;
+    type ValidatorBuilder = BbEngineValidatorBuilder<EthereumEngineValidatorBuilder>;
 
     fn engine_validator_builder(&self) -> Self::ValidatorBuilder {
-        let pvb = BbPayloadValidatorBuilder::new(self.pending.clone());
-        BasicEngineValidatorBuilder::new(pvb)
+        BbEngineValidatorBuilder::new(self.pending.clone())
     }
 }
 
@@ -452,8 +315,7 @@ where
         Ok(Arc::new(
             EthBeaconConsensus::new(ctx.chain_spec())
                 .with_skip_gas_limit_ramp_check(true)
-                .with_skip_requests_hash_check(true)
-                .with_max_blob_count(Some(10000)),
+                .with_skip_blob_gas_used_check(true),
         ))
     }
 }
