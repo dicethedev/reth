@@ -9,7 +9,7 @@ pub(crate) use reth_engine_primitives::BigBlockData;
 
 use crate::BigBlockMap;
 use alloy_evm::Evm as _;
-use alloy_primitives::{Bloom, B256};
+use alloy_primitives::B256;
 use alloy_rpc_types::engine::ExecutionData;
 use reth_chainspec::EthChainSpec;
 use reth_engine_primitives::{ConfigureEngineEvm, ExecutionPayload, PayloadValidator};
@@ -36,7 +36,6 @@ use reth_revm::{
     database::StateProviderDatabase,
     db::{states::bundle_state::BundleRetention, State},
 };
-use revm_primitives::Address;
 use std::sync::{atomic::Ordering, Arc};
 use tracing::{debug, info, trace};
 
@@ -139,7 +138,7 @@ impl BbBlockExecutor {
     /// Consumes transactions from the handle's iterator, splitting them across
     /// segment boundaries defined in the execution plan.
     fn execute_block_multiseg<Evm, S, Err, Tx, T>(
-        &mut self,
+        &self,
         ctx: &mut ExecuteBlockCtx<'_, Evm>,
         state_provider: S,
         env: ExecutionEnv<Evm>,

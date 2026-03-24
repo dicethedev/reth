@@ -427,7 +427,7 @@ impl Command {
                 let mut total_gas_limit = base.payload.as_v1().gas_limit;
 
                 // Concatenate transactions from subsequent blocks and build env_switches
-                for (block_data, receipts) in blocks.into_iter().zip(block_receipts.into_iter()) {
+                for (block_data, receipts) in blocks.into_iter().zip(block_receipts) {
                     let block_v1 = block_data.payload.as_v1();
                     let block_gas = block_v1.gas_used;
                     total_gas_used += block_gas;

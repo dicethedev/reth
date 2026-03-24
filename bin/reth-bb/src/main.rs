@@ -58,7 +58,7 @@ pub type BigBlockMap = Arc<Mutex<HashMap<B256, BigBlockData<ExecutionData>>>>;
 /// payload is forwarded to the consensus engine.
 #[jsonrpsee::proc_macros::rpc(server, namespace = "reth")]
 pub trait BbRethEngineApi {
-    /// reth_newPayload with optional big-block data.
+    /// `reth_newPayload` with optional big-block data.
     #[method(name = "newPayload")]
     async fn reth_new_payload(
         &self,
@@ -68,7 +68,7 @@ pub trait BbRethEngineApi {
         big_block_data: Option<BigBlockData<ExecutionData>>,
     ) -> RpcResult<RethPayloadStatus>;
 
-    /// reth_forkchoiceUpdated – pass-through.
+    /// `reth_forkchoiceUpdated` – pass-through.
     #[method(name = "forkchoiceUpdated")]
     async fn reth_forkchoice_updated(
         &self,
@@ -157,7 +157,7 @@ pub struct BbAddOns {
 }
 
 impl BbAddOns {
-    fn new(pending: BigBlockMap) -> Self {
+    const fn new(pending: BigBlockMap) -> Self {
         Self { pending }
     }
 
@@ -260,7 +260,7 @@ pub struct BbNode {
 }
 
 impl BbNode {
-    fn new(pending: BigBlockMap) -> Self {
+    const fn new(pending: BigBlockMap) -> Self {
         Self { pending }
     }
 }
