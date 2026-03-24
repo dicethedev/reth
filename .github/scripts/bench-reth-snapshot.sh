@@ -26,8 +26,14 @@ BUCKET="minio/reth-snapshots"
 # big-blocks manifest specifies which base snapshot to use).
 SNAPSHOT_NAME="${BENCH_SNAPSHOT_NAME:-reth-1-minimal-stable}"
 MANIFEST_PATH="${SNAPSHOT_NAME}/manifest.json"
-DATADIR="$SCHELK_MOUNT/datadir"
-HASH_FILE="$HOME/.reth-bench-snapshot-hash"
+DATADIR_NAME="datadir"
+HASH_MODE_SUFFIX=""
+if [ "${BENCH_BIG_BLOCKS:-false}" = "true" ]; then
+  DATADIR_NAME="datadir-big-blocks"
+  HASH_MODE_SUFFIX="-big-blocks"
+fi
+DATADIR="$SCHELK_MOUNT/$DATADIR_NAME"
+HASH_FILE="$HOME/.reth-bench-snapshot-hash${HASH_MODE_SUFFIX}"
 
 # Fetch manifest and compute content hash for reliable freshness check
 MANIFEST_CONTENT=$($MC cat "${BUCKET}/${MANIFEST_PATH}" 2>/dev/null) || {

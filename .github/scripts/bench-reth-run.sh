@@ -18,7 +18,11 @@ set -euo pipefail
 LABEL="$1"
 BINARY="$2"
 OUTPUT_DIR="$3"
-DATADIR="$SCHELK_MOUNT/datadir"
+DATADIR_NAME="datadir"
+if [ "${BENCH_BIG_BLOCKS:-false}" = "true" ]; then
+  DATADIR_NAME="datadir-big-blocks"
+fi
+DATADIR="$SCHELK_MOUNT/$DATADIR_NAME"
 mkdir -p "$OUTPUT_DIR"
 LOG="${OUTPUT_DIR}/node.log"
 
