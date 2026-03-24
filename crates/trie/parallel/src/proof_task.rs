@@ -36,7 +36,10 @@ use alloy_primitives::{
     map::{B256Map, B256Set},
     B256,
 };
-use crossbeam_channel::{unbounded, Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
+use crossbeam_channel::{
+    bounded, Receiver as CrossbeamReceiver, Sender as CrossbeamSender,
+    TryRecvError as CrossbeamTryRecvError,
+};
 use reth_execution_errors::{SparseTrieError, SparseTrieErrorKind, StateProofError};
 use reth_primitives_traits::{dashmap::DashMap, FastInstant as Instant};
 use reth_provider::{DatabaseProviderROFactory, ProviderError, ProviderResult};
@@ -69,6 +72,22 @@ use crate::proof_task_metrics::{
 };
 
 type TrieNodeProviderResult = Result<Option<RevealedNode>, SparseTrieError>;
+
+/// Queue depth per worker for proof worker pools.
+///
+/// We keep queue capacity proportional to worker count so each pool can absorb short bursts while
+/// still providing bounded backpressure to avoid list-channel contention growth under sustained
+/// load.
+const PROOF_WORK_QUEUE_CAPACITY_PER_WORKER: usize = 64;
+
+/// Minimum queue depth to avoid under-provisioning very small pools.
+const PROOF_WORK_QUEUE_MIN_CAPACITY: usize = 256;
+
+/// Number of jobs a worker drains opportunistically after each blocking receive.
+///
+/// Batching reduces repeated `recv` churn and amortizes availability-counter updates across
+/// multiple jobs.
+const PROOF_WORKER_BATCH_SIZE: usize = 8;
 
 /// Type alias for the V2 account proof calculator.
 type V2AccountProofCalculator<'a, Provider> = proof_v2::ProofCalculator<
@@ -137,9 +156,6 @@ impl ProofWorkerHandle {
             + Sync
             + 'static,
     {
-        let (storage_work_tx, storage_work_rx) = unbounded::<StorageWorkerJob>();
-        let (account_work_tx, account_work_rx) = unbounded::<AccountWorkerJob>();
-
         let storage_available_workers = Arc::<AtomicUsize>::default();
         let account_available_workers = Arc::<AtomicUsize>::default();
 
@@ -151,10 +167,22 @@ impl ProofWorkerHandle {
         let account_worker_count =
             runtime.proof_account_worker_pool().current_num_threads() / divisor;
 
+        let storage_queue_capacity = (storage_worker_count * PROOF_WORK_QUEUE_CAPACITY_PER_WORKER)
+            .max(PROOF_WORK_QUEUE_MIN_CAPACITY);
+        let account_queue_capacity = (account_worker_count * PROOF_WORK_QUEUE_CAPACITY_PER_WORKER)
+            .max(PROOF_WORK_QUEUE_MIN_CAPACITY);
+
+        let (storage_work_tx, storage_work_rx) =
+            bounded::<StorageWorkerJob>(storage_queue_capacity);
+        let (account_work_tx, account_work_rx) =
+            bounded::<AccountWorkerJob>(account_queue_capacity);
+
         debug!(
             target: "trie::proof_task",
             storage_worker_count,
             account_worker_count,
+            storage_queue_capacity,
+            account_queue_capacity,
             halve_workers,
             "Spawning proof worker pools"
         );
@@ -714,50 +742,64 @@ where
 
         let mut total_idle_time = Duration::ZERO;
         let mut idle_start = Instant::now();
+        let mut job_batch = Vec::with_capacity(PROOF_WORKER_BATCH_SIZE);
 
-        while let Ok(job) = self.work_rx.recv() {
+        while let Ok(first_job) = self.work_rx.recv() {
             total_idle_time += idle_start.elapsed();
 
-            // Mark worker as busy.
+            // Mark worker as busy once for the whole batch.
             self.available_workers.fetch_sub(1, Ordering::Relaxed);
 
-            #[cfg(feature = "trie-debug")]
-            if let Some(max_jitter) = self.task_ctx.proof_jitter {
-                let jitter =
-                    Duration::from_nanos(rand::random_range(0..=max_jitter.as_nanos() as u64));
-                trace!(
-                    target: "trie::proof_task",
-                    worker_id = self.worker_id,
-                    jitter_us = jitter.as_micros(),
-                    "Storage worker applying proof jitter"
-                );
-                std::thread::sleep(jitter);
-            }
-
-            match job {
-                StorageWorkerJob::StorageProof { input, proof_result_sender } => {
-                    self.process_storage_proof(
-                        &proof_tx,
-                        &mut v2_calculator,
-                        input,
-                        proof_result_sender,
-                        &mut storage_proofs_processed,
-                    );
-                }
-
-                StorageWorkerJob::BlindedStorageNode { account, path, result_sender } => {
-                    Self::process_blinded_node(
-                        self.worker_id,
-                        &proof_tx,
-                        account,
-                        path,
-                        result_sender,
-                        &mut storage_nodes_processed,
-                    );
+            job_batch.clear();
+            job_batch.push(first_job);
+            while job_batch.len() < PROOF_WORKER_BATCH_SIZE {
+                match self.work_rx.try_recv() {
+                    Ok(job) => job_batch.push(job),
+                    Err(CrossbeamTryRecvError::Empty | CrossbeamTryRecvError::Disconnected) => {
+                        break
+                    }
                 }
             }
 
-            // Mark worker as available again.
+            for job in job_batch.drain(..) {
+                #[cfg(feature = "trie-debug")]
+                if let Some(max_jitter) = self.task_ctx.proof_jitter {
+                    let jitter =
+                        Duration::from_nanos(rand::random_range(0..=max_jitter.as_nanos() as u64));
+                    trace!(
+                        target: "trie::proof_task",
+                        worker_id = self.worker_id,
+                        jitter_us = jitter.as_micros(),
+                        "Storage worker applying proof jitter"
+                    );
+                    std::thread::sleep(jitter);
+                }
+
+                match job {
+                    StorageWorkerJob::StorageProof { input, proof_result_sender } => {
+                        self.process_storage_proof(
+                            &proof_tx,
+                            &mut v2_calculator,
+                            input,
+                            proof_result_sender,
+                            &mut storage_proofs_processed,
+                        );
+                    }
+
+                    StorageWorkerJob::BlindedStorageNode { account, path, result_sender } => {
+                        Self::process_blinded_node(
+                            self.worker_id,
+                            &proof_tx,
+                            account,
+                            path,
+                            result_sender,
+                            &mut storage_nodes_processed,
+                        );
+                    }
+                }
+            }
+
+            // Mark worker as available once after the whole batch.
             self.available_workers.fetch_add(1, Ordering::Relaxed);
 
             idle_start = Instant::now();
@@ -1000,51 +1042,66 @@ where
         let mut total_idle_time = Duration::ZERO;
         let mut idle_start = Instant::now();
         let mut value_encoder_stats_cache = ValueEncoderStats::default();
+        let mut job_batch = Vec::with_capacity(PROOF_WORKER_BATCH_SIZE);
 
-        while let Ok(job) = self.work_rx.recv() {
+        while let Ok(first_job) = self.work_rx.recv() {
             total_idle_time += idle_start.elapsed();
 
-            // Mark worker as busy.
+            // Mark worker as busy once for the whole batch.
             self.available_workers.fetch_sub(1, Ordering::Relaxed);
 
-            #[cfg(feature = "trie-debug")]
-            if let Some(max_jitter) = self.task_ctx.proof_jitter {
-                let jitter =
-                    Duration::from_nanos(rand::random_range(0..=max_jitter.as_nanos() as u64));
-                trace!(
-                    target: "trie::proof_task",
-                    worker_id = self.worker_id,
-                    jitter_us = jitter.as_micros(),
-                    "Account worker applying proof jitter"
-                );
-                std::thread::sleep(jitter);
-            }
-
-            match job {
-                AccountWorkerJob::AccountMultiproof { input } => {
-                    let value_encoder_stats = self.process_account_multiproof::<Factory::Provider>(
-                        &mut v2_account_calculator,
-                        v2_storage_calculator.clone(),
-                        *input,
-                        &mut account_proofs_processed,
-                        &mut cursor_metrics_cache,
-                    );
-                    total_idle_time += value_encoder_stats.storage_wait_time;
-                    value_encoder_stats_cache.extend(&value_encoder_stats);
-                }
-
-                AccountWorkerJob::BlindedAccountNode { path, result_sender } => {
-                    Self::process_blinded_node(
-                        self.worker_id,
-                        &provider,
-                        path,
-                        result_sender,
-                        &mut account_nodes_processed,
-                    );
+            job_batch.clear();
+            job_batch.push(first_job);
+            while job_batch.len() < PROOF_WORKER_BATCH_SIZE {
+                match self.work_rx.try_recv() {
+                    Ok(job) => job_batch.push(job),
+                    Err(CrossbeamTryRecvError::Empty | CrossbeamTryRecvError::Disconnected) => {
+                        break
+                    }
                 }
             }
 
-            // Mark worker as available again.
+            for job in job_batch.drain(..) {
+                #[cfg(feature = "trie-debug")]
+                if let Some(max_jitter) = self.task_ctx.proof_jitter {
+                    let jitter =
+                        Duration::from_nanos(rand::random_range(0..=max_jitter.as_nanos() as u64));
+                    trace!(
+                        target: "trie::proof_task",
+                        worker_id = self.worker_id,
+                        jitter_us = jitter.as_micros(),
+                        "Account worker applying proof jitter"
+                    );
+                    std::thread::sleep(jitter);
+                }
+
+                match job {
+                    AccountWorkerJob::AccountMultiproof { input } => {
+                        let value_encoder_stats = self
+                            .process_account_multiproof::<Factory::Provider>(
+                                &mut v2_account_calculator,
+                                v2_storage_calculator.clone(),
+                                *input,
+                                &mut account_proofs_processed,
+                                &mut cursor_metrics_cache,
+                            );
+                        total_idle_time += value_encoder_stats.storage_wait_time;
+                        value_encoder_stats_cache.extend(&value_encoder_stats);
+                    }
+
+                    AccountWorkerJob::BlindedAccountNode { path, result_sender } => {
+                        Self::process_blinded_node(
+                            self.worker_id,
+                            &provider,
+                            path,
+                            result_sender,
+                            &mut account_nodes_processed,
+                        );
+                    }
+                }
+            }
+
+            // Mark worker as available once after the whole batch.
             self.available_workers.fetch_add(1, Ordering::Relaxed);
 
             idle_start = Instant::now();
