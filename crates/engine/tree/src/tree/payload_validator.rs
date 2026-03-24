@@ -1883,6 +1883,16 @@ pub struct ExecuteBlockOutcome<R> {
     pub receipt_root_rx: tokio::sync::oneshot::Receiver<(B256, Bloom)>,
 }
 
+impl<R: core::fmt::Debug> core::fmt::Debug for ExecuteBlockOutcome<R> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ExecuteBlockOutcome")
+            .field("output", &self.output)
+            .field("senders", &self.senders)
+            .field("receipt_root_rx", &"Receiver<(B256, Bloom)>")
+            .finish()
+    }
+}
+
 /// Strategy for executing a block within [`BasicEngineValidator`].
 ///
 /// The default implementation ([`BasicEngineValidatorBlockExecutor`]) handles standard
