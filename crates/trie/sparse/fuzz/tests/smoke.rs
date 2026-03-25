@@ -81,7 +81,7 @@ fn smoke_boundary4_single_prefix() {
             key_seed: 55,
             value_seed: 66,
             key_count: 200,
-            size_mode: InitialSizeMode::Mixed,
+            size_mode: InitialSizeMode::Large,
             layout: InitialLayout::Mixed,
         },
         round_count: 3,

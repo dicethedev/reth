@@ -47,8 +47,6 @@ pub enum InitialSizeMode {
     Large,
     /// Small state to maximize structural churn and branch collapse activity.
     Small,
-    /// Per-input mix of small and large states.
-    Mixed,
 }
 
 /// Key distribution for the initial state.

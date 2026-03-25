@@ -58,19 +58,9 @@ pub fn build_initial_storage(spec: &InitialStateSpec) -> BTreeMap<B256, U256> {
 }
 
 fn normalize_initial_count(spec: &InitialStateSpec) -> usize {
-    let large = 500 + (spec.key_count % 1501) as usize;
-    let small = 8 + (spec.key_count % 57) as usize;
-
     match spec.size_mode {
-        InitialSizeMode::Large => large,
-        InitialSizeMode::Small => small,
-        InitialSizeMode::Mixed => {
-            if spec.key_seed & 1 == 0 {
-                small
-            } else {
-                large
-            }
-        }
+        InitialSizeMode::Large => 500 + (spec.key_count % 1501) as usize,
+        InitialSizeMode::Small => 8 + (spec.key_count % 57) as usize,
     }
 }
 
