@@ -402,10 +402,10 @@ mod tests {
     #[test]
     fn test_forkchoice_state_hash_find() {
         // Define example hashes
-        let head_hash = B256::random();
-        let safe_hash = B256::random();
-        let finalized_hash = B256::random();
-        let non_matching_hash = B256::random();
+        let head_hash = B256::with_last_byte(1);
+        let safe_hash = B256::with_last_byte(2);
+        let finalized_hash = B256::with_last_byte(3);
+        let non_matching_hash = B256::with_last_byte(4);
 
         // Create a ForkchoiceState with specific hashes
         let state = ForkchoiceState {
