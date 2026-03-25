@@ -46,6 +46,5 @@ default = []
 op = [
     "dep:op-alloy-consensus",
     "dep:op-alloy-rpc-types",
-    "reth-evm/op",
     
 ]

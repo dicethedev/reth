@@ -124,5 +124,4 @@ test-utils = [
 trie-debug = ["reth-engine-tree/trie-debug"]
 op = [
     "reth-engine-local/op",
-    "reth-evm/op",
 ]
