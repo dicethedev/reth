@@ -89,6 +89,8 @@ pub struct RevmcMetrics {
     pub resident_entries: metrics::Gauge,
     /// Approximate total bytes of compiled code in the resident map.
     pub resident_bytes: metrics::Gauge,
+    /// Number of pending JIT compilation jobs in the queue.
+    pub jit_queue_len: metrics::Gauge,
 }
 
 impl RevmcMetrics {
@@ -101,6 +103,7 @@ impl RevmcMetrics {
             events_dropped,
             resident_entries,
             resident_bytes,
+            jit_queue_len,
         } = *stats;
         self.lookup_hits.set(lookup_hits as f64);
         self.lookup_misses.set(lookup_misses as f64);
@@ -108,5 +111,6 @@ impl RevmcMetrics {
         self.events_dropped.set(events_dropped as f64);
         self.resident_entries.set(resident_entries as f64);
         self.resident_bytes.set(resident_bytes as f64);
+        self.jit_queue_len.set(jit_queue_len as f64);
     }
 }
