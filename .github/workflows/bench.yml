@@ -719,6 +719,39 @@ jobs:
             core.setOutput('feature-ref', featureRef);
             core.setOutput('feature-name', featureName);
 
+      - name: Check big-blocks freshness
+        if: env.BENCH_BIG_BLOCKS == 'true'
+        id: big-blocks-check
+        run: |
+          set -euo pipefail
+          MC="mc --config-dir /home/ubuntu/.mc"
+          MANIFEST="minio/reth-snapshots/brian-test-big-blocks.json"
+          HASH_FILE="$HOME/.reth-bench-big-blocks-hash"
+          echo "Fetching big-blocks manifest from $MANIFEST..."
+          BB_MANIFEST=$($MC cat "$MANIFEST" 2>/dev/null) || {
+            echo "::error::Failed to fetch big-blocks manifest from $MANIFEST"
+            exit 1
+          }
+          BASE_SNAPSHOT=$(echo "$BB_MANIFEST" | jq -r '.base_snapshot // empty')
+          if [ -z "$BASE_SNAPSHOT" ]; then
+            echo "::error::Big-blocks manifest missing base_snapshot field"
+            exit 1
+          fi
+          echo "Big-blocks base snapshot: $BASE_SNAPSHOT"
+          echo "BENCH_SNAPSHOT_NAME=${BASE_SNAPSHOT}" >> "$GITHUB_ENV"
+
+          REMOTE_HASH=$(echo "$BB_MANIFEST" | sha256sum | awk '{print $1}')
+          LOCAL_HASH=""
+          [ -f "$HASH_FILE" ] && LOCAL_HASH=$(cat "$HASH_FILE")
+          if [ "$REMOTE_HASH" = "$LOCAL_HASH" ]; then
+            echo "Big blocks up-to-date (hash: ${REMOTE_HASH:0:16}…)"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Big blocks need update (local: ${LOCAL_HASH:+${LOCAL_HASH:0:16}…}${LOCAL_HASH:-<none>}, remote: ${REMOTE_HASH:0:16}…)"
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "remote-hash=${REMOTE_HASH}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check if snapshot needs update
         id: snapshot-check
         run: |
@@ -846,9 +879,15 @@ jobs:
         if: env.BENCH_BIG_BLOCKS == 'true'
         run: |
           set -euo pipefail
+          BIG_BLOCKS_DIR="$HOME/.reth-bench-big-blocks"
+          echo "BENCH_BIG_BLOCKS_DIR=${BIG_BLOCKS_DIR}" >> "$GITHUB_ENV"
+          if [ "${{ steps.big-blocks-check.outputs.needed }}" = "false" ]; then
+            echo "Big blocks cached at $BIG_BLOCKS_DIR, skipping download"
+            echo "Payload files: $(find "$BIG_BLOCKS_DIR/payloads" -name '*.json' | wc -l)"
+            exit 0
+          fi
           MC="mc --config-dir /home/ubuntu/.mc"
           MANIFEST="minio/reth-snapshots/brian-test-big-blocks.json"
-          BIG_BLOCKS_DIR="${BENCH_WORK_DIR}/big-blocks"
           rm -rf "$BIG_BLOCKS_DIR"; mkdir -p "$BIG_BLOCKS_DIR"
 
           # Download and parse manifest
@@ -871,13 +910,9 @@ jobs:
             ls -laR "$BIG_BLOCKS_DIR"
             exit 1
           fi
-          PAYLOAD_COUNT=$(find "$BIG_BLOCKS_DIR/payloads" -name '*.json' | wc -l)
-          echo "Payload files: $PAYLOAD_COUNT"
-
-          # Apply blocks limit if specified (skip warmup payloads, take N)
-          if [ "${BENCH_BLOCKS:-500}" != "500" ]; then
-            echo "Limiting big block replay to $BENCH_BLOCKS payloads"
-          fi
+          echo "Payload files: $(find "$BIG_BLOCKS_DIR/payloads" -name '*.json' | wc -l)"
+          # Save manifest hash for freshness check on next run
+          echo "${{ steps.big-blocks-check.outputs.remote-hash }}" > "$HOME/.reth-bench-big-blocks-hash"
 
       - name: Start metrics proxy
         run: |
