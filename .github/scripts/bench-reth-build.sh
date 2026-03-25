@@ -100,6 +100,11 @@ case "$MODE" in
       $MC cp "${BUCKET}/reth" "${SOURCE_DIR}/target/profiling/reth"
       $MC cp "${BUCKET}/reth-bench" /home/ubuntu/.cargo/bin/reth-bench
       chmod +x "${SOURCE_DIR}/target/profiling/reth" /home/ubuntu/.cargo/bin/reth-bench
+      # Download reth-bb if cached (optional, only needed for big-block benchmarks)
+      if $MC stat "${BUCKET}/reth-bb" &>/dev/null; then
+        $MC cp "${BUCKET}/reth-bb" "${SOURCE_DIR}/target/profiling/reth-bb"
+        chmod +x "${SOURCE_DIR}/target/profiling/reth-bb"
+      fi
       if verify_binary "${SOURCE_DIR}/target/profiling/reth" "${COMMIT}"; then
         CACHE_VALID=true
       else
@@ -118,9 +123,18 @@ case "$MODE" in
       else
         make profiling
       fi
+      # Build reth-bb if source tree has it (big-block benchmarking)
+      if [ -d "bin/reth-bb" ]; then
+        echo "Building reth-bb..."
+        RUSTFLAGS="-C target-cpu=native${EXTRA_RUSTFLAGS}" \
+          cargo build --profile profiling --bin reth-bb
+      fi
       make install-reth-bench
       $MC cp target/profiling/reth "${BUCKET}/reth"
       $MC cp "$(which reth-bench)" "${BUCKET}/reth-bench"
+      if [ -f target/profiling/reth-bb ]; then
+        $MC cp target/profiling/reth-bb "${BUCKET}/reth-bb"
+      fi
     fi
     ;;
 
