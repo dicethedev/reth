@@ -208,10 +208,6 @@ impl BbBlockExecutor {
                 transaction_count
             };
 
-            if stop_before <= global_tx_idx {
-                continue;
-            }
-
             let is_final = stop_before >= transaction_count;
 
             debug!(
