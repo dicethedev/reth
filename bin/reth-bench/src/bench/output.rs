@@ -25,6 +25,8 @@ pub(crate) struct NewPayloadResult {
     pub(crate) gas_used: u64,
     /// The latency of the `newPayload` call.
     pub(crate) latency: Duration,
+    /// Time spent waiting in the tree backpressure queue. `None` when the message was not queued.
+    pub(crate) backpressure_wait: Option<Duration>,
     /// Time spent waiting for persistence. `None` when no persistence was in-flight.
     pub(crate) persistence_wait: Option<Duration>,
     /// Time spent waiting for execution cache lock.
@@ -61,9 +63,11 @@ impl Serialize for NewPayloadResult {
     {
         // convert the time to microseconds
         let time = self.latency.as_micros();
-        let mut state = serializer.serialize_struct("NewPayloadResult", 5)?;
+        let mut state = serializer.serialize_struct("NewPayloadResult", 6)?;
         state.serialize_field("gas_used", &self.gas_used)?;
         state.serialize_field("latency", &time)?;
+        state
+            .serialize_field("backpressure_wait", &self.backpressure_wait.map(|d| d.as_micros()))?;
         state.serialize_field("persistence_wait", &self.persistence_wait.map(|d| d.as_micros()))?;
         state.serialize_field("execution_cache_wait", &self.execution_cache_wait.as_micros())?;
         state.serialize_field("sparse_trie_wait", &self.sparse_trie_wait.as_micros())?;
@@ -119,6 +123,9 @@ impl std::fmt::Display for CombinedResult {
         if let Some(d) = np.persistence_wait {
             write!(f, ", persistence wait: {d:?}")?;
         }
+        if let Some(d) = np.backpressure_wait {
+            write!(f, ", backpressure wait: {d:?}")?;
+        }
         Ok(())
     }
 }
@@ -134,7 +141,7 @@ impl Serialize for CombinedResult {
         let fcu_latency = self.fcu_latency.as_micros();
         let new_payload_latency = self.new_payload_result.latency.as_micros();
         let total_latency = self.total_latency.as_micros();
-        let mut state = serializer.serialize_struct("CombinedResult", 10)?;
+        let mut state = serializer.serialize_struct("CombinedResult", 11)?;
 
         // flatten the new payload result because this is meant for CSV writing
         state.serialize_field("block_number", &self.block_number)?;
@@ -144,6 +151,10 @@ impl Serialize for CombinedResult {
         state.serialize_field("new_payload_latency", &new_payload_latency)?;
         state.serialize_field("fcu_latency", &fcu_latency)?;
         state.serialize_field("total_latency", &total_latency)?;
+        state.serialize_field(
+            "backpressure_wait",
+            &self.new_payload_result.backpressure_wait.map(|d| d.as_micros()),
+        )?;
         state.serialize_field(
             "persistence_wait",
             &self.new_payload_result.persistence_wait.map(|d| d.as_micros()),
@@ -312,6 +323,39 @@ mod tests {
         assert_eq!(first_line, expected_first_line);
 
         let expected_second_line = "1,10,1000,1000000";
+        let second_line = result.next().unwrap().unwrap();
+        assert_eq!(second_line, expected_second_line);
+    }
+
+    #[test]
+    fn test_write_combined_result_csv_includes_backpressure_wait() {
+        let result = CombinedResult {
+            block_number: 1,
+            gas_limit: 30_000_000,
+            transaction_count: 10,
+            new_payload_result: NewPayloadResult {
+                gas_used: 1_000,
+                latency: Duration::from_micros(2_000),
+                backpressure_wait: Some(Duration::from_micros(300)),
+                persistence_wait: Some(Duration::from_micros(400)),
+                execution_cache_wait: Duration::from_micros(500),
+                sparse_trie_wait: Duration::from_micros(600),
+            },
+            fcu_latency: Duration::from_micros(700),
+            total_latency: Duration::from_micros(2_700),
+        };
+
+        let mut writer = Writer::from_writer(vec![]);
+        writer.serialize(result).unwrap();
+        let result = writer.into_inner().unwrap();
+
+        let mut result = result.as_slice().lines();
+
+        let expected_first_line = "block_number,gas_limit,transaction_count,gas_used,new_payload_latency,fcu_latency,total_latency,backpressure_wait,persistence_wait,execution_cache_wait,sparse_trie_wait";
+        let first_line = result.next().unwrap().unwrap();
+        assert_eq!(first_line, expected_first_line);
+
+        let expected_second_line = "1,30000000,10,1000,2000,700,2700,300,400,500,600";
         let second_line = result.next().unwrap().unwrap();
         assert_eq!(second_line, expected_second_line);
     }

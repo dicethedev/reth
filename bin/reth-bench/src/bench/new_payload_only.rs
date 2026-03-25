@@ -142,6 +142,7 @@ impl Command {
             let new_payload_result = NewPayloadResult {
                 gas_used,
                 latency,
+                backpressure_wait: server_timings.as_ref().and_then(|t| t.backpressure_wait),
                 persistence_wait: server_timings.as_ref().and_then(|t| t.persistence_wait),
                 execution_cache_wait: server_timings
                     .as_ref()

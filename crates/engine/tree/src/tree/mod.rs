@@ -40,7 +40,13 @@ use reth_tasks::{spawn_os_thread, utils::increase_thread_priority};
 use reth_trie_db::ChangesetCache;
 use revm::interpreter::debug_unreachable;
 use state::TreeState;
-use std::{collections::HashMap, fmt::Debug, ops, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt::Debug,
+    ops,
+    sync::Arc,
+    time::Duration,
+};
 
 use crossbeam_channel::{Receiver, Sender};
 use tokio::sync::{
@@ -250,6 +256,12 @@ pub enum TreeAction {
     },
 }
 
+#[derive(Debug)]
+struct QueuedBeaconMessage<T: PayloadTypes> {
+    enqueued_at: Instant,
+    message: BeaconEngineMessage<T>,
+}
+
 /// The engine API tree handler implementation.
 ///
 /// This type is responsible for processing engine API requests, maintaining the canonical state and
@@ -276,6 +288,8 @@ where
     incoming_tx: Sender<FromEngine<EngineApiRequest<T, N>, N::Block>>,
     /// Incoming engine API requests.
     incoming: Receiver<FromEngine<EngineApiRequest<T, N>, N::Block>>,
+    /// Buffered beacon messages waiting to be processed once persistence catches up.
+    buffered_beacon_messages: VecDeque<QueuedBeaconMessage<T>>,
     /// Outgoing events that are emitted to the handler.
     outgoing: UnboundedSender<EngineApiEvent<N>>,
     /// Channels to the persistence layer.
@@ -321,6 +335,7 @@ where
             .field("payload_validator", &self.payload_validator)
             .field("state", &self.state)
             .field("incoming_tx", &self.incoming_tx)
+            .field("buffered_beacon_messages", &self.buffered_beacon_messages.len())
             .field("persistence", &self.persistence)
             .field("persistence_state", &self.persistence_state)
             .field("backfill_sync_state", &self.backfill_sync_state)
@@ -381,6 +396,7 @@ where
             consensus,
             payload_validator,
             incoming,
+            buffered_beacon_messages: VecDeque::new(),
             outgoing,
             persistence,
             persistence_state,
@@ -472,12 +488,100 @@ where
         self.incoming_tx.clone()
     }
 
+    fn update_backpressure_buffer_len_metric(&self) {
+        self.metrics.engine.backpressure_buffer_len.set(self.buffered_beacon_messages.len() as f64);
+    }
+
+    fn enqueue_beacon_message(&mut self, message: BeaconEngineMessage<T>) {
+        self.buffered_beacon_messages
+            .push_back(QueuedBeaconMessage { enqueued_at: Instant::now(), message });
+        self.update_backpressure_buffer_len_metric();
+    }
+
+    fn persistence_gap(&self) -> u64 {
+        self.state
+            .tree_state
+            .canonical_block_number()
+            .saturating_sub(self.persistence_state.last_persisted_block.number)
+    }
+
+    fn should_backpressure(&self) -> bool {
+        !self.buffered_beacon_messages.is_empty()
+            && self.persistence_gap() >= self.config.persistence_backpressure_threshold()
+    }
+
+    fn try_process_buffered_beacon_message(
+        &mut self,
+    ) -> Result<Option<ops::ControlFlow<()>>, InsertBlockFatalError> {
+        if self.should_backpressure() {
+            return Ok(None);
+        }
+
+        let Some(queued) = self.buffered_beacon_messages.pop_front() else {
+            return Ok(None);
+        };
+        self.update_backpressure_buffer_len_metric();
+
+        let wait = queued.enqueued_at.elapsed();
+        match &queued.message {
+            BeaconEngineMessage::NewPayload { .. } | BeaconEngineMessage::RethNewPayload { .. } => {
+                self.metrics.engine.new_payload_backpressure_wait_seconds.record(wait);
+            }
+            BeaconEngineMessage::ForkchoiceUpdated { .. } => {
+                self.metrics.engine.fcu_backpressure_wait_seconds.record(wait);
+            }
+        }
+
+        self.process_beacon_message(queued.message, Some(wait)).map(Some)
+    }
+
     /// Run the engine API handler.
     ///
     /// This will block the current thread and process incoming messages.
     pub fn run(mut self) {
         loop {
-            match self.wait_for_event() {
+            match self.try_poll_persistence_completion() {
+                Ok(true) => {
+                    if let Err(err) = self.advance_persistence() {
+                        error!(target: "engine::tree", %err, "Advancing persistence failed");
+                        return
+                    }
+                    continue;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    error!(target: "engine::tree", %err, "Polling persistence failed");
+                    return
+                }
+            }
+
+            match self.try_process_buffered_beacon_message() {
+                Ok(Some(ops::ControlFlow::Break(()))) => return,
+                Ok(Some(ops::ControlFlow::Continue(()))) => {
+                    if let Err(err) = self.advance_persistence() {
+                        error!(target: "engine::tree", %err, "Advancing persistence failed");
+                        return
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+                Err(fatal) => {
+                    error!(target: "engine::tree", %fatal, "insert block fatal error");
+                    return
+                }
+            }
+
+            let event = if self.should_backpressure() {
+                if let Err(err) = self.advance_persistence() {
+                    error!(target: "engine::tree", %err, "Advancing persistence failed");
+                    return
+                }
+                self.wait_for_backpressure_event()
+            } else {
+                self.wait_for_event()
+            };
+
+            match event {
                 LoopEvent::EngineMessage(msg) => {
                     debug!(target: "engine::tree", %msg, "received new engine message");
                     match self.on_engine_message(msg) {
@@ -509,6 +613,19 @@ where
                 error!(target: "engine::tree", %err, "Advancing persistence failed");
                 return
             }
+        }
+    }
+
+    fn wait_for_backpressure_event(&mut self) -> LoopEvent<T, N> {
+        let maybe_persistence = self.persistence_state.rx.take();
+
+        if let Some((persistence_rx, start_time, _action)) = maybe_persistence {
+            match persistence_rx.recv() {
+                Ok(result) => LoopEvent::PersistenceComplete { result, start_time },
+                Err(_) => LoopEvent::Disconnected,
+            }
+        } else {
+            self.wait_for_event()
         }
     }
 
@@ -1341,8 +1458,7 @@ where
     /// Tries to poll for a completed persistence task (non-blocking).
     ///
     /// Returns `true` if a persistence task was completed, `false` otherwise.
-    #[cfg(test)]
-    pub fn try_poll_persistence(&mut self) -> Result<bool, AdvancePersistenceError> {
+    fn try_poll_persistence_completion(&mut self) -> Result<bool, AdvancePersistenceError> {
         let Some((rx, start_time, action)) = self.persistence_state.rx.take() else {
             return Ok(false);
         };
@@ -1361,6 +1477,11 @@ where
                 Err(AdvancePersistenceError::ChannelClosed)
             }
         }
+    }
+
+    #[cfg(test)]
+    fn try_poll_persistence(&mut self) -> Result<bool, AdvancePersistenceError> {
+        self.try_poll_persistence_completion()
     }
 
     /// Handles a completed persistence task.
@@ -1479,165 +1600,14 @@ where
                         ));
                     }
                     EngineApiRequest::Beacon(request) => {
-                        match request {
-                            BeaconEngineMessage::ForkchoiceUpdated { state, payload_attrs, tx } => {
-                                let has_attrs = payload_attrs.is_some();
-
-                                let start = Instant::now();
-                                let mut output = self.on_forkchoice_updated(state, payload_attrs);
-
-                                if let Ok(res) = &mut output {
-                                    // track last received forkchoice state
-                                    self.state
-                                        .forkchoice_state_tracker
-                                        .set_latest(state, res.outcome.forkchoice_status());
-
-                                    // emit an event about the handled FCU
-                                    self.emit_event(ConsensusEngineEvent::ForkchoiceUpdated(
-                                        state,
-                                        res.outcome.forkchoice_status(),
-                                    ));
-
-                                    // handle the event if any
-                                    self.on_maybe_tree_event(res.event.take())?;
-                                }
-
-                                if let Err(ref err) = output {
-                                    error!(target: "engine::tree", %err, ?state, "Error processing forkchoice update");
-                                }
-
-                                self.metrics.engine.forkchoice_updated.update_response_metrics(
-                                    start,
-                                    &mut self.metrics.engine.new_payload.latest_finish_at,
-                                    has_attrs,
-                                    &output,
-                                );
-
-                                if let Err(err) =
-                                    tx.send(output.map(|o| o.outcome).map_err(Into::into))
-                                {
-                                    self.metrics
-                                        .engine
-                                        .failed_forkchoice_updated_response_deliveries
-                                        .increment(1);
-                                    warn!(target: "engine::tree", ?state, elapsed=?start.elapsed(), "Failed to deliver forkchoiceUpdated response, receiver dropped (request cancelled): {err:?}");
-                                }
-                            }
-                            BeaconEngineMessage::NewPayload { payload, tx } => {
-                                let start = Instant::now();
-                                let gas_used = payload.gas_used();
-                                let num_hash = payload.num_hash();
-                                let mut output = self.on_new_payload(payload);
-                                self.metrics.engine.new_payload.update_response_metrics(
-                                    start,
-                                    &mut self.metrics.engine.forkchoice_updated.latest_finish_at,
-                                    &output,
-                                    gas_used,
-                                );
-
-                                let maybe_event =
-                                    output.as_mut().ok().and_then(|out| out.event.take());
-
-                                // emit response
-                                if let Err(err) =
-                                    tx.send(output.map(|o| o.outcome).map_err(|e| {
-                                        BeaconOnNewPayloadError::Internal(Box::new(e))
-                                    }))
-                                {
-                                    warn!(target: "engine::tree", payload=?num_hash, elapsed=?start.elapsed(), "Failed to deliver newPayload response, receiver dropped (request cancelled): {err:?}");
-                                    self.metrics
-                                        .engine
-                                        .failed_new_payload_response_deliveries
-                                        .increment(1);
-                                }
-
-                                // handle the event if any
-                                self.on_maybe_tree_event(maybe_event)?;
-                            }
-                            BeaconEngineMessage::RethNewPayload {
-                                payload,
-                                wait_for_persistence,
-                                wait_for_caches,
-                                tx,
-                            } => {
-                                debug!(
-                                    target: "engine::tree",
-                                    wait_for_persistence,
-                                    wait_for_caches,
-                                    "Processing reth_newPayload"
-                                );
-
-                                let persistence_wait = if wait_for_persistence {
-                                    let pending_persistence = self.persistence_state.rx.take();
-                                    if let Some((rx, start_time, _action)) = pending_persistence {
-                                        let (persistence_tx, persistence_rx) =
-                                            std::sync::mpsc::channel();
-                                        self.runtime.spawn_blocking_named(
-                                            "wait-persist",
-                                            move || {
-                                                let start = Instant::now();
-                                                let result = rx
-                                                    .recv()
-                                                    .expect("persistence state channel closed");
-                                                let _ = persistence_tx.send((
-                                                    result,
-                                                    start_time,
-                                                    start.elapsed(),
-                                                ));
-                                            },
-                                        );
-                                        let (result, start_time, wait_duration) = persistence_rx
-                                            .recv()
-                                            .expect("persistence result channel closed");
-                                        let _ = self.on_persistence_complete(result, start_time);
-                                        Some(wait_duration)
-                                    } else {
-                                        Some(Duration::ZERO)
-                                    }
-                                } else {
-                                    None
-                                };
-
-                                let cache_wait = wait_for_caches
-                                    .then(|| self.payload_validator.wait_for_caches());
-
-                                let start = Instant::now();
-                                let gas_used = payload.gas_used();
-                                let num_hash = payload.num_hash();
-                                let mut output = self.on_new_payload(payload);
-                                let latency = start.elapsed();
-                                self.metrics.engine.new_payload.update_response_metrics(
-                                    start,
-                                    &mut self.metrics.engine.forkchoice_updated.latest_finish_at,
-                                    &output,
-                                    gas_used,
-                                );
-
-                                let maybe_event =
-                                    output.as_mut().ok().and_then(|out| out.event.take());
-
-                                let timings = NewPayloadTimings {
-                                    latency,
-                                    persistence_wait,
-                                    execution_cache_wait: cache_wait
-                                        .map(|wait| wait.execution_cache),
-                                    sparse_trie_wait: cache_wait.map(|wait| wait.sparse_trie),
-                                };
-                                if let Err(err) =
-                                    tx.send(output.map(|o| (o.outcome, timings)).map_err(|e| {
-                                        BeaconOnNewPayloadError::Internal(Box::new(e))
-                                    }))
-                                {
-                                    error!(target: "engine::tree", payload=?num_hash, elapsed=?start.elapsed(), "Failed to send event: {err:?}");
-                                    self.metrics
-                                        .engine
-                                        .failed_new_payload_response_deliveries
-                                        .increment(1);
-                                }
-
-                                self.on_maybe_tree_event(maybe_event)?;
-                            }
+                        if matches!(
+                            &request,
+                            BeaconEngineMessage::ForkchoiceUpdated { payload_attrs: Some(_), .. }
+                        ) {
+                            return self.process_beacon_message(request, None);
                         }
+
+                        self.enqueue_beacon_message(request);
                     }
                 }
             }
@@ -1647,6 +1617,144 @@ where
                 }
             }
         }
+        Ok(ops::ControlFlow::Continue(()))
+    }
+
+    fn process_beacon_message(
+        &mut self,
+        request: BeaconEngineMessage<T>,
+        backpressure_wait: Option<Duration>,
+    ) -> Result<ops::ControlFlow<()>, InsertBlockFatalError> {
+        match request {
+            BeaconEngineMessage::ForkchoiceUpdated { state, payload_attrs, tx } => {
+                let has_attrs = payload_attrs.is_some();
+
+                let start = Instant::now();
+                let mut output = self.on_forkchoice_updated(state, payload_attrs);
+
+                if let Ok(res) = &mut output {
+                    self.state
+                        .forkchoice_state_tracker
+                        .set_latest(state, res.outcome.forkchoice_status());
+
+                    self.emit_event(ConsensusEngineEvent::ForkchoiceUpdated(
+                        state,
+                        res.outcome.forkchoice_status(),
+                    ));
+
+                    self.on_maybe_tree_event(res.event.take())?;
+                }
+
+                if let Err(ref err) = output {
+                    error!(target: "engine::tree", %err, ?state, "Error processing forkchoice update");
+                }
+
+                self.metrics.engine.forkchoice_updated.update_response_metrics(
+                    start,
+                    &mut self.metrics.engine.new_payload.latest_finish_at,
+                    has_attrs,
+                    &output,
+                );
+
+                if let Err(err) = tx.send(output.map(|o| o.outcome).map_err(Into::into)) {
+                    self.metrics.engine.failed_forkchoice_updated_response_deliveries.increment(1);
+                    warn!(target: "engine::tree", ?state, elapsed=?start.elapsed(), "Failed to deliver forkchoiceUpdated response, receiver dropped (request cancelled): {err:?}");
+                }
+            }
+            BeaconEngineMessage::NewPayload { payload, tx } => {
+                let start = Instant::now();
+                let gas_used = payload.gas_used();
+                let num_hash = payload.num_hash();
+                let mut output = self.on_new_payload(payload);
+                self.metrics.engine.new_payload.update_response_metrics(
+                    start,
+                    &mut self.metrics.engine.forkchoice_updated.latest_finish_at,
+                    &output,
+                    gas_used,
+                );
+
+                let maybe_event = output.as_mut().ok().and_then(|out| out.event.take());
+
+                if let Err(err) = tx.send(
+                    output
+                        .map(|o| o.outcome)
+                        .map_err(|e| BeaconOnNewPayloadError::Internal(Box::new(e))),
+                ) {
+                    warn!(target: "engine::tree", payload=?num_hash, elapsed=?start.elapsed(), "Failed to deliver newPayload response, receiver dropped (request cancelled): {err:?}");
+                    self.metrics.engine.failed_new_payload_response_deliveries.increment(1);
+                }
+
+                self.on_maybe_tree_event(maybe_event)?;
+            }
+            BeaconEngineMessage::RethNewPayload {
+                payload,
+                wait_for_persistence,
+                wait_for_caches,
+                tx,
+            } => {
+                debug!(
+                    target: "engine::tree",
+                    wait_for_persistence,
+                    wait_for_caches,
+                    "Processing reth_newPayload"
+                );
+
+                let persistence_wait = if wait_for_persistence {
+                    let pending_persistence = self.persistence_state.rx.take();
+                    if let Some((rx, start_time, _action)) = pending_persistence {
+                        let (persistence_tx, persistence_rx) = std::sync::mpsc::channel();
+                        self.runtime.spawn_blocking_named("wait-persist", move || {
+                            let start = Instant::now();
+                            let result = rx.recv().expect("persistence state channel closed");
+                            let _ = persistence_tx.send((result, start_time, start.elapsed()));
+                        });
+                        let (result, start_time, wait_duration) =
+                            persistence_rx.recv().expect("persistence result channel closed");
+                        let _ = self.on_persistence_complete(result, start_time);
+                        Some(wait_duration)
+                    } else {
+                        Some(Duration::ZERO)
+                    }
+                } else {
+                    None
+                };
+
+                let cache_wait = wait_for_caches.then(|| self.payload_validator.wait_for_caches());
+
+                let start = Instant::now();
+                let gas_used = payload.gas_used();
+                let num_hash = payload.num_hash();
+                let mut output = self.on_new_payload(payload);
+                let latency = start.elapsed();
+                self.metrics.engine.new_payload.update_response_metrics(
+                    start,
+                    &mut self.metrics.engine.forkchoice_updated.latest_finish_at,
+                    &output,
+                    gas_used,
+                );
+
+                let maybe_event = output.as_mut().ok().and_then(|out| out.event.take());
+
+                let timings = NewPayloadTimings {
+                    latency,
+                    backpressure_wait,
+                    persistence_wait,
+                    execution_cache_wait: cache_wait.map(|wait| wait.execution_cache),
+                    sparse_trie_wait: cache_wait.map(|wait| wait.sparse_trie),
+                };
+                if let Err(err) = tx.send(
+                    output
+                        .map(|o| (o.outcome, timings))
+                        .map_err(|e| BeaconOnNewPayloadError::Internal(Box::new(e))),
+                ) {
+                    error!(target: "engine::tree", payload=?num_hash, elapsed=?start.elapsed(), "Failed to send event: {err:?}");
+                    self.metrics.engine.failed_new_payload_response_deliveries.increment(1);
+                }
+
+                self.on_maybe_tree_event(maybe_event)?;
+            }
+        }
+
         Ok(ops::ControlFlow::Continue(()))
     }
 

@@ -13,6 +13,11 @@ pub struct RethPayloadStatus {
     pub status: PayloadStatus,
     /// Server-side execution latency in microseconds.
     pub latency_us: u64,
+    /// Time spent waiting in the backpressure queue before processing, in microseconds.
+    ///
+    /// `None` when the message was not queued.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backpressure_wait_us: Option<u64>,
     /// Time spent waiting for persistence to complete, in microseconds.
     ///
     /// `None` when wasn't asked to wait.

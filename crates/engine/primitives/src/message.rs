@@ -148,6 +148,10 @@ impl Future for PendingPayloadId {
 pub struct NewPayloadTimings {
     /// Server-side execution latency.
     pub latency: Duration,
+    /// Time spent waiting in the backpressure queue before processing.
+    ///
+    /// `None` when the message was not queued.
+    pub backpressure_wait: Option<Duration>,
     /// Time spent waiting for persistence to complete.
     ///
     /// `None` when wasn't asked to wait for persistence.
