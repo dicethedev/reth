@@ -16,7 +16,7 @@
 
 use alloy_consensus::{Header, Transaction};
 use alloy_eips::eip2718::Decodable2718;
-use alloy_evm::{Evm, RecoveredTx};
+use alloy_evm::{env::BlockEnvironment, Evm, RecoveredTx};
 use alloy_primitives::{map::HashSet, Address, U256};
 use alloy_rlp::Encodable;
 use alloy_rpc_types_engine::ExecutionPayloadEnvelopeV5;
@@ -49,6 +49,9 @@ pub struct TestingApi<Eth, Evm> {
     evm_config: Evm,
     /// If true, skip invalid transactions instead of failing.
     skip_invalid_transactions: bool,
+    /// If true, zero out the basefee in the EVM block environment before executing
+    /// transactions, so any gas price passes the base fee check.
+    skip_basefee_check: bool,
     /// If set, override the parent block's gas limit in `testing_buildBlockV1`.
     gas_limit_override: Option<u64>,
 }
@@ -56,7 +59,13 @@ pub struct TestingApi<Eth, Evm> {
 impl<Eth, Evm> TestingApi<Eth, Evm> {
     /// Create a new testing API handler.
     pub const fn new(eth_api: Eth, evm_config: Evm) -> Self {
-        Self { eth_api, evm_config, skip_invalid_transactions: false, gas_limit_override: None }
+        Self {
+            eth_api,
+            evm_config,
+            skip_invalid_transactions: false,
+            skip_basefee_check: false,
+            gas_limit_override: None,
+        }
     }
 
     /// Enable skipping invalid transactions instead of failing.
@@ -64,6 +73,13 @@ impl<Eth, Evm> TestingApi<Eth, Evm> {
     /// skipped.
     pub const fn with_skip_invalid_transactions(mut self) -> Self {
         self.skip_invalid_transactions = true;
+        self
+    }
+
+    /// Enable skipping base fee validation by zeroing the basefee in the EVM block
+    /// environment.
+    pub const fn with_skip_basefee_check(mut self) -> Self {
+        self.skip_basefee_check = true;
         self
     }
 
@@ -89,6 +105,7 @@ where
     ) -> Result<ExecutionPayloadEnvelopeV5, Eth::Error> {
         let evm_config = self.evm_config.clone();
         let skip_invalid_transactions = self.skip_invalid_transactions;
+        let skip_basefee_check = self.skip_basefee_check;
         let gas_limit_override = self.gas_limit_override;
         self.eth_api
             .spawn_with_state_at_block(request.parent_block_hash, move |eth_api, state| {
@@ -121,10 +138,21 @@ where
                     extra_data: request.extra_data.unwrap_or_default(),
                 };
 
-                let mut builder = evm_config
-                    .builder_for_next_block(&mut db, &parent, env_attrs)
+                // Build the EVM env manually so we can optionally disable the basefee check
+                let mut evm_env = evm_config
+                    .next_evm_env(&parent, &env_attrs)
                     .map_err(RethError::other)
                     .map_err(Eth::Error::from_eth_err)?;
+                if skip_basefee_check {
+                    evm_env.cfg_env.disable_base_fee = true;
+                    evm_env.block_env.inner_mut().basefee = 0;
+                }
+                let ctx = evm_config
+                    .context_for_next_block(&parent, env_attrs)
+                    .map_err(RethError::other)
+                    .map_err(Eth::Error::from_eth_err)?;
+                let evm = evm_config.evm_with_env(&mut db, evm_env);
+                let mut builder = evm_config.create_block_builder(evm, &parent, ctx);
                 builder.apply_pre_execution_changes().map_err(Eth::Error::from_eth_err)?;
 
                 let mut total_fees = U256::ZERO;

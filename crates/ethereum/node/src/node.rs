@@ -288,6 +288,7 @@ where
             EthConfigHandler::new(ctx.node.provider().clone(), ctx.node.evm_config().clone());
 
         let testing_skip_invalid_transactions = ctx.config.rpc.testing_skip_invalid_transactions;
+        let testing_skip_basefee_check = ctx.config.rpc.testing_skip_basefee_check;
         let testing_gas_limit_override = ctx.config.rpc.testing_gas_limit;
 
         self.inner
@@ -309,6 +310,9 @@ where
                 );
                 if testing_skip_invalid_transactions {
                     testing_api = testing_api.with_skip_invalid_transactions();
+                }
+                if testing_skip_basefee_check {
+                    testing_api = testing_api.with_skip_basefee_check();
                 }
                 if let Some(gas_limit) = testing_gas_limit_override {
                     testing_api = testing_api.with_gas_limit_override(gas_limit);

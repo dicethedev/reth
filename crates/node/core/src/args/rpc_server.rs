@@ -648,6 +648,13 @@ pub struct RpcServerArgs {
     #[arg(long = "testing.skip-invalid-transactions", default_value_t = true)]
     pub testing_skip_invalid_transactions: bool,
 
+    /// Skip base fee validation in `testing_buildBlockV1`.
+    ///
+    /// When enabled, the EVM's base fee is set to zero before executing transactions,
+    /// so transactions with any gas price will pass the base fee check.
+    #[arg(long = "testing.skip-basefee-check", default_value_t = false, hide = true)]
+    pub testing_skip_basefee_check: bool,
+
     /// Skip the 1/1024 gas limit change restriction between parent and child blocks.
     ///
     /// When enabled, consensus will not enforce the gas limit bound divisor check,
@@ -902,6 +909,7 @@ impl Default for RpcServerArgs {
             gas_price_oracle,
             rpc_send_raw_transaction_sync_timeout,
             testing_skip_invalid_transactions: true,
+            testing_skip_basefee_check: false,
             testing_skip_gas_limit_ramp_check: false,
             testing_gas_limit: None,
             rpc_force_blob_sidecar_upcasting: false,
@@ -1081,6 +1089,7 @@ mod tests {
             },
             rpc_send_raw_transaction_sync_timeout: std::time::Duration::from_secs(30),
             testing_skip_invalid_transactions: true,
+            testing_skip_basefee_check: false,
             testing_skip_gas_limit_ramp_check: false,
             testing_gas_limit: None,
             rpc_force_blob_sidecar_upcasting: false,
