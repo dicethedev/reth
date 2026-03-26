@@ -673,6 +673,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                     blocks.iter().rev().map(|b| b.trie_data().hashed_state),
                 );
                 if !merged_hashed_state.is_empty() {
+                    timings.hashed_state_data_bytes += merged_hashed_state.data_size();
                     self.write_hashed_state(&merged_hashed_state)?;
                 }
                 timings.write_hashed_state += start.elapsed();
@@ -681,6 +682,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 let merged_trie =
                     TrieUpdatesSorted::merge_batch(blocks.iter().rev().map(|b| b.trie_updates()));
                 if !merged_trie.is_empty() {
+                    timings.trie_updates_data_bytes += merged_trie.data_size();
                     self.write_trie_updates_sorted(&merged_trie)?;
                 }
                 timings.write_trie_updates += start.elapsed();
