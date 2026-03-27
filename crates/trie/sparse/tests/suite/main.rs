@@ -35,6 +35,7 @@ mod find_leaf;
 mod get_leaf_value;
 mod lifecycle;
 mod prune;
+mod regressions;
 mod reveal_nodes;
 mod root;
 mod set_root;
