@@ -7638,6 +7638,7 @@ dependencies = [
 name = "reth-bench"
 version = "1.11.3"
 dependencies = [
+ "alloy-consensus",
  "alloy-eips",
  "alloy-json-rpc",
  "alloy-primitives",
@@ -7656,8 +7657,6 @@ dependencies = [
  "eyre",
  "futures",
  "humantime",
- "op-alloy-consensus",
- "op-alloy-rpc-types-engine",
  "reqwest 0.13.2",
  "reth-cli-runner",
  "reth-cli-util",

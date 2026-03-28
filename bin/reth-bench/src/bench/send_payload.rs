@@ -1,9 +1,8 @@
 use super::helpers::{load_jwt_secret, read_input};
+use crate::payload_converter::PayloadConverter;
 use alloy_provider::network::AnyRpcBlock;
-use alloy_rpc_types_engine::ExecutionPayload;
 use clap::Parser;
 use eyre::{OptionExt, Result};
-use op_alloy_consensus::OpTxEnvelope;
 use reth_cli_runner::CliContext;
 use std::io::Write;
 
@@ -53,7 +52,7 @@ enum Mode {
 
 impl Command {
     /// Execute the generate payload command
-    pub async fn execute(self, _ctx: CliContext) -> Result<()> {
+    pub async fn execute<C: PayloadConverter>(self, _ctx: CliContext, converter: &C) -> Result<()> {
         // Load block
         let block_json = read_input(self.path.as_deref())?;
 
@@ -61,49 +60,20 @@ impl Command {
         let jwt_secret = load_jwt_secret(self.jwt_secret.as_deref())?;
 
         // Parse the block
-        let block = serde_json::from_str::<AnyRpcBlock>(&block_json)?
-            .into_inner()
-            .map_header(|header| header.map(|h| h.into_header_with_defaults()))
-            .try_map_transactions(|tx| {
-                // try to convert unknowns into op type so that we can also support optimism
-                tx.try_into_either::<OpTxEnvelope>()
-            })?
-            .into_consensus();
+        let block = serde_json::from_str::<AnyRpcBlock>(&block_json)?;
 
-        // Extract parent beacon block root
-        let parent_beacon_block_root = block.header.parent_beacon_block_root;
+        let (payload, sidecar) = converter.block_to_payload(block)?;
+        let (version, params, _execution_data) =
+            converter.payload_to_new_payload(payload, sidecar, None)?;
 
-        // Extract blob versioned hashes
-        let blob_versioned_hashes =
-            block.body.blob_versioned_hashes_iter().copied().collect::<Vec<_>>();
-
-        // Convert to execution payload
-        let execution_payload = ExecutionPayload::from_block_slow(&block).0;
-
-        let use_v4 = block.header.requests_hash.is_some();
-
-        // Create JSON request data
-        let json_request = if use_v4 {
-            serde_json::to_string(&(
-                execution_payload,
-                blob_versioned_hashes,
-                parent_beacon_block_root,
-                block.header.requests_hash.unwrap_or_default(),
-            ))?
-        } else {
-            serde_json::to_string(&(
-                execution_payload,
-                blob_versioned_hashes,
-                parent_beacon_block_root,
-            ))?
-        };
+        let json_request = serde_json::to_string(&params)?;
+        let method = version.method_name();
 
         // Print output or execute command
         match self.mode {
             Mode::Execute => {
                 // Create cast command
                 let mut command = std::process::Command::new("cast");
-                let method = if use_v4 { "engine_newPayloadV4" } else { "engine_newPayloadV3" };
                 command.arg("rpc").arg(method).arg("--raw");
                 if let Some(rpc_url) = self.rpc_url {
                     command.arg("--rpc-url").arg(rpc_url);
@@ -126,10 +96,7 @@ impl Command {
                 process.wait()?;
             }
             Mode::Cast => {
-                let mut cmd = format!(
-                    "cast rpc engine_newPayloadV{} --raw '{}'",
-                    self.new_payload_version, json_request
-                );
+                let mut cmd = format!("cast rpc {} --raw '{}'", method, json_request);
 
                 if let Some(rpc_url) = self.rpc_url {
                     cmd += &format!(" --rpc-url {rpc_url}");

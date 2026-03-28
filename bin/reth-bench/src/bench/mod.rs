@@ -1,5 +1,6 @@
 //! `reth benchmark` command. Collection of various benchmarking routines.
 
+use crate::payload_converter::PayloadConverter;
 use clap::{Parser, Subcommand};
 use reth_cli_runner::CliContext;
 use reth_node_core::args::LogArgs;
@@ -88,17 +89,21 @@ pub enum Subcommands {
 
 impl BenchmarkCommand {
     /// Execute `benchmark` command
-    pub async fn execute(self, ctx: CliContext) -> eyre::Result<()> {
+    pub async fn execute<C: PayloadConverter>(
+        self,
+        ctx: CliContext,
+        converter: C,
+    ) -> eyre::Result<()> {
         // Initialize tracing
         let _guard = self.init_tracing()?;
 
         match self.command {
-            Subcommands::NewPayloadFcu(command) => command.execute(ctx).await,
-            Subcommands::NewPayloadOnly(command) => command.execute(ctx).await,
-            Subcommands::SendPayload(command) => command.execute(ctx).await,
+            Subcommands::NewPayloadFcu(command) => command.execute(ctx, &converter).await,
+            Subcommands::NewPayloadOnly(command) => command.execute(ctx, &converter).await,
+            Subcommands::SendPayload(command) => command.execute(ctx, &converter).await,
             Subcommands::GenerateBigBlock(command) => command.execute(ctx).await,
             Subcommands::ReplayPayloads(command) => command.execute(ctx).await,
-            Subcommands::SendInvalidPayload(command) => (*command).execute(ctx).await,
+            Subcommands::SendInvalidPayload(command) => (*command).execute(ctx, &converter).await,
         }
     }
 

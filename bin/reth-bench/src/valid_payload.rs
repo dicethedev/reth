@@ -2,15 +2,13 @@
 //! response. This is useful for benchmarking, as it allows us to wait for a payload to be valid
 //! before sending additional calls.
 
-use alloy_eips::eip7685::Requests;
-use alloy_primitives::{Bytes, B256};
+use crate::payload_converter::PayloadConverter;
+use alloy_primitives::Bytes;
 use alloy_provider::{ext::EngineApi, network::AnyRpcBlock, Network, Provider};
 use alloy_rpc_types_engine::{
-    ExecutionData, ExecutionPayload, ExecutionPayloadInputV2, ExecutionPayloadSidecar,
-    ForkchoiceState, ForkchoiceUpdated, PayloadAttributes, PayloadStatus,
+    ExecutionData, ForkchoiceState, ForkchoiceUpdated, PayloadAttributes, PayloadStatus,
 };
 use alloy_transport::TransportResult;
-use op_alloy_rpc_types_engine::OpExecutionPayloadV4;
 use reth_node_api::EngineApiMessageVersion;
 use reth_node_core::args::WaitForPersistence;
 use reth_rpc_api::RethNewPayloadInput;
@@ -171,9 +169,9 @@ where
 ///
 /// `wait_for_persistence` controls how `wait_for_persistence` is passed to
 /// `reth_newPayload` on a per-block basis.
-pub(crate) fn block_to_new_payload(
+pub(crate) fn block_to_new_payload<C: PayloadConverter>(
+    converter: &C,
     block: AnyRpcBlock,
-    is_optimism: bool,
     rlp: Option<Bytes>,
     reth_new_payload: bool,
     wait_for_persistence: WaitForPersistence,
@@ -192,19 +190,10 @@ pub(crate) fn block_to_new_payload(
             ))?,
         ));
     }
-    let block = block
-        .into_inner()
-        .map_header(|header| header.map(|h| h.into_header_with_defaults()))
-        .try_map_transactions(|tx| {
-            // try to convert unknowns into op type so that we can also support optimism
-            tx.try_into_either::<op_alloy_consensus::OpTxEnvelope>()
-        })?
-        .into_consensus();
 
-    // Convert to execution payload
-    let (payload, sidecar) = ExecutionPayload::from_block_slow(&block);
+    let (payload, sidecar) = converter.block_to_payload(block)?;
     let (version, params, execution_data) =
-        payload_to_new_payload(payload, sidecar, is_optimism, block.withdrawals_root, None)?;
+        converter.payload_to_new_payload(payload, sidecar, None)?;
 
     if reth_new_payload {
         Ok((
@@ -218,80 +207,6 @@ pub(crate) fn block_to_new_payload(
     } else {
         Ok((Some(version), params))
     }
-}
-
-/// Converts an execution payload and sidecar into versioned engine API params and an
-/// [`ExecutionData`].
-///
-/// Returns `(version, versioned_params, execution_data)`.
-pub(crate) fn payload_to_new_payload(
-    payload: ExecutionPayload,
-    sidecar: ExecutionPayloadSidecar,
-    is_optimism: bool,
-    withdrawals_root: Option<B256>,
-    target_version: Option<EngineApiMessageVersion>,
-) -> eyre::Result<(EngineApiMessageVersion, serde_json::Value, ExecutionData)> {
-    let execution_data = ExecutionData { payload: payload.clone(), sidecar: sidecar.clone() };
-
-    let (version, params) = match payload {
-        ExecutionPayload::V3(payload) => {
-            let cancun = sidecar.cancun().unwrap();
-
-            if let Some(prague) = sidecar.prague() {
-                // Use target version if provided (for Osaka), otherwise default to V4
-                let version = target_version.unwrap_or(EngineApiMessageVersion::V4);
-
-                if is_optimism {
-                    let withdrawals_root = withdrawals_root.ok_or_else(|| {
-                        eyre::eyre!("Missing withdrawals root for Optimism payload")
-                    })?;
-                    (
-                        version,
-                        serde_json::to_value((
-                            OpExecutionPayloadV4 { payload_inner: payload, withdrawals_root },
-                            cancun.versioned_hashes.clone(),
-                            cancun.parent_beacon_block_root,
-                            Requests::default(),
-                        ))?,
-                    )
-                } else {
-                    // Preserve the original RequestsOrHash payload for engine_newPayloadV4.
-                    let requests = prague.requests.clone();
-                    (
-                        version,
-                        serde_json::to_value((
-                            payload,
-                            cancun.versioned_hashes.clone(),
-                            cancun.parent_beacon_block_root,
-                            requests,
-                        ))?,
-                    )
-                }
-            } else {
-                (
-                    EngineApiMessageVersion::V3,
-                    serde_json::to_value((
-                        payload,
-                        cancun.versioned_hashes.clone(),
-                        cancun.parent_beacon_block_root,
-                    ))?,
-                )
-            }
-        }
-        ExecutionPayload::V2(payload) => {
-            let input = ExecutionPayloadInputV2 {
-                execution_payload: payload.payload_inner,
-                withdrawals: Some(payload.withdrawals),
-            };
-
-            (EngineApiMessageVersion::V2, serde_json::to_value((input,))?)
-        }
-        ExecutionPayload::V1(payload) => {
-            (EngineApiMessageVersion::V1, serde_json::to_value((payload,))?)
-        }
-    };
-
-    Ok((version, params, execution_data))
 }
 
 /// Calls the correct `engine_newPayload` method depending on the given [`ExecutionPayload`] and its

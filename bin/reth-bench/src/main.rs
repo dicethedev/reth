@@ -20,10 +20,12 @@ use reth_cli_util::allocator::tikv_jemalloc_sys as _;
 pub mod authenticated_transport;
 pub mod bench;
 pub mod bench_mode;
+pub mod payload_converter;
 pub mod valid_payload;
 
 use bench::BenchmarkCommand;
 use clap::Parser;
+use payload_converter::EthereumPayloadConverter;
 use reth_cli_runner::CliRunner;
 
 fn main() -> eyre::Result<()> {
@@ -38,7 +40,9 @@ fn main() -> eyre::Result<()> {
 
     // Run until either exit or sigint or sigterm
     let runner = CliRunner::try_default_runtime()?;
-    runner.run_command_until_exit(|ctx| BenchmarkCommand::parse().execute(ctx))?;
+    runner.run_command_until_exit(|ctx| {
+        BenchmarkCommand::parse().execute(ctx, EthereumPayloadConverter)
+    })?;
 
     Ok(())
 }
