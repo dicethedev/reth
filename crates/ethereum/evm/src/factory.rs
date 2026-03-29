@@ -15,11 +15,11 @@ use revmc::alloy_evm as jit;
 
 pub use jit::JitEvm;
 pub use revmc::{
-    CompileTimings,
     runtime::{
         CompilationEvent, CompilationKind, JitBackend, RuntimeConfig, RuntimeStatsSnapshot,
         RuntimeTuning,
     },
+    CompileTimings,
 };
 
 /// Newtype around [`revmc::alloy_evm::JitEvmFactory`] that implements [`Debug`].
@@ -101,12 +101,12 @@ pub struct RevmcMetrics {
     pub jit_queue_len: metrics::Gauge,
     /// Total number of entries evicted (idle + budget).
     pub evictions: metrics::Gauge,
-    /// Total number of JIT promotions (hot threshold reached).
-    pub jit_promotions: metrics::Gauge,
-    /// Total number of successful JIT compilations.
-    pub jit_successes: metrics::Gauge,
-    /// Total number of failed JIT compilations.
-    pub jit_failures: metrics::Gauge,
+    /// Total number of compilations dispatched (JIT promotions + AOT requests).
+    pub compilations_dispatched: metrics::Gauge,
+    /// Total number of successful compilations (JIT + AOT).
+    pub compilations_succeeded: metrics::Gauge,
+    /// Total number of failed compilations (JIT + AOT).
+    pub compilations_failed: metrics::Gauge,
     /// Histogram of total JIT compilation durations (seconds).
     pub jit_compilation_duration: metrics::Histogram,
     /// Duration of the last JIT compilation (seconds).
@@ -134,9 +134,9 @@ impl RevmcMetrics {
             jit_data_bytes,
             jit_queue_len,
             evictions,
-            jit_promotions,
-            jit_successes,
-            jit_failures,
+            compilations_dispatched,
+            compilations_succeeded,
+            compilations_failed,
         } = *stats;
         self.lookup_hits.set(lookup_hits as f64);
         self.lookup_misses.set(lookup_misses as f64);
@@ -147,9 +147,9 @@ impl RevmcMetrics {
         self.jit_data_bytes.set(jit_data_bytes as f64);
         self.jit_queue_len.set(jit_queue_len as f64);
         self.evictions.set(evictions as f64);
-        self.jit_promotions.set(jit_promotions as f64);
-        self.jit_successes.set(jit_successes as f64);
-        self.jit_failures.set(jit_failures as f64);
+        self.compilations_dispatched.set(compilations_dispatched as f64);
+        self.compilations_succeeded.set(compilations_succeeded as f64);
+        self.compilations_failed.set(compilations_failed as f64);
     }
 
     /// Records a [`CompilationEvent`] into the histogram metrics.
