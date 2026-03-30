@@ -156,11 +156,11 @@ where
         // By taking the strategies here and re-applying them later in `on_save_blocks`,
         // we ensure the truncation only happens when no reader needs the old data:
         // after the reorg completes and the next batch of blocks is persisted.
-        if self.provider.cached_storage_settings().storage_v2 {
-            if let Some(target) = self.provider.static_file_provider().take_changeset_prunes() {
-                self.deferred_changeset_prune =
-                    Some(self.deferred_changeset_prune.map_or(target, |prev| prev.min(target)));
-            }
+        if self.provider.cached_storage_settings().storage_v2 &&
+            let Some(target) = self.provider.static_file_provider().take_changeset_prunes()
+        {
+            self.deferred_changeset_prune =
+                Some(self.deferred_changeset_prune.map_or(target, |prev| prev.min(target)));
         }
 
         provider_rw.commit()?;
