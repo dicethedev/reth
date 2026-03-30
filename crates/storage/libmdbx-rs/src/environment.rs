@@ -412,6 +412,14 @@ impl Info {
         self.0.mi_recent_txnid as usize
     }
 
+    /// Transaction ID of the oldest active reader across all processes.
+    ///
+    /// Returns 0 if no readers are active.
+    #[inline]
+    pub const fn latter_reader_txnid(&self) -> u64 {
+        self.0.mi_latter_reader_txnid
+    }
+
     /// Max reader slots in the environment
     #[inline]
     pub const fn max_readers(&self) -> usize {

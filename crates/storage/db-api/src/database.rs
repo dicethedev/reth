@@ -39,6 +39,19 @@ pub trait Database: Send + Sync + Debug {
         Ok(res)
     }
 
+    /// Returns the transaction ID of the oldest active reader, if available.
+    ///
+    /// Used to check whether stale readers from a previous write transaction have completed.
+    /// Returns `None` if no readers are active or the backend does not support this query.
+    fn oldest_reader_txnid(&self) -> Option<u64> {
+        None
+    }
+
+    /// Returns the ID of the most recently committed transaction, if available.
+    fn last_txnid(&self) -> Option<u64> {
+        None
+    }
+
     /// Takes a function and passes a write-read transaction into it, making sure it's committed in
     /// the end of the execution.
     fn update<T, F>(&self, f: F) -> Result<T, DatabaseError>
@@ -69,6 +82,14 @@ impl<DB: Database> Database for Arc<DB> {
     fn path(&self) -> PathBuf {
         <DB as Database>::path(self)
     }
+
+    fn oldest_reader_txnid(&self) -> Option<u64> {
+        <DB as Database>::oldest_reader_txnid(self)
+    }
+
+    fn last_txnid(&self) -> Option<u64> {
+        <DB as Database>::last_txnid(self)
+    }
 }
 
 impl<DB: Database> Database for &DB {
@@ -85,5 +106,13 @@ impl<DB: Database> Database for &DB {
 
     fn path(&self) -> PathBuf {
         <DB as Database>::path(self)
+    }
+
+    fn oldest_reader_txnid(&self) -> Option<u64> {
+        <DB as Database>::oldest_reader_txnid(self)
+    }
+
+    fn last_txnid(&self) -> Option<u64> {
+        <DB as Database>::last_txnid(self)
     }
 }
