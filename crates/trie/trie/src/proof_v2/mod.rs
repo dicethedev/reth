@@ -928,7 +928,7 @@ where
 
         // If the trie cursor is seeked to a branch whose leaves have already been processed
         // then we can't use it, instead we seek forward and try again.
-        if trie_cursor_path < uncalculated_lower_bound {
+        if PathPrefixRelation::new(trie_cursor_path, uncalculated_lower_bound).is_before_prefix() {
             *trie_cursor_state =
                 TrieCursorState::seeked(self.trie_cursor_seek(*uncalculated_lower_bound)?);
 
@@ -962,7 +962,9 @@ where
         // If the next cached branch's path is all zeros then we can skip this catch-up step,
         // because there cannot be any keys prior to that range.
         let cached_path = &cached.0;
-        if uncalculated_lower_bound < cached_path && !cached_path.is_zeroes() {
+        if PathPrefixRelation::new(uncalculated_lower_bound, cached_path).is_before_prefix() &&
+            !cached_path.is_zeroes()
+        {
             let range = (*uncalculated_lower_bound, Some(*cached_path));
             trace!(target: TRACE_TARGET, ?range, "Returning key range to calculate in order to catch up to cached branch");
 
@@ -1078,6 +1080,11 @@ where
                 self.push_cached_branch(targets, cached_path, &cached_branch)?;
             }
 
+            let branch_path = self.branch_path;
+            let branch_path_len = branch_path.len();
+            let lower_bound_relation =
+                PathPrefixRelation::new(uncalculated_lower_bound_ref, &branch_path);
+
             // At this point the top of the branch stack is the same branch which was found in the
             // cache.
             let curr_branch =
@@ -1094,9 +1101,8 @@ where
             // indicate children that need recalculation from leaves (e.g. new keys inserted
             // under this branch). Skip nibbles already set in `curr_state_mask` since those
             // children have already been constructed.
-            if self.prefix_set.contains(&self.branch_path) {
-                let branch_path_len = self.branch_path.len();
-                let mut child_path = self.branch_path;
+            if self.prefix_set.contains(&branch_path) {
+                let mut child_path = branch_path;
                 for nibble in 0u8..16 {
                     if !curr_state_mask.is_bit_set(nibble) {
                         child_path.truncate(branch_path_len);
@@ -1114,35 +1120,33 @@ where
             // This can happen when `calculate_key_range` finds no keys for a child's range,
             // leaving the child's bit unset in `state_mask`. Without this, re-entering this
             // function would select the same child again.
-            if uncalculated_lower_bound_ref.starts_with(&self.branch_path) &&
-                uncalculated_lower_bound_ref.len() > self.branch_path.len()
-            {
-                let lower_nibble =
-                    uncalculated_lower_bound_ref.get_unchecked(self.branch_path.len());
-                // Clear all nibbles strictly below `lower_nibble` since they've been processed.
-                let already_processed_mask = TrieMask::new((1u16 << lower_nibble) - 1);
-                next_child_nibbles &= !already_processed_mask;
-                trace!(
-                    target: TRACE_TARGET,
-                    branch_path = ?self.branch_path,
-                    ?_orig_next_child_nibbles,
-                    ?already_processed_mask,
-                    ?next_child_nibbles,
-                    "Unset already processed key nibbles from next_child_nibbles",
-                );
-            } else if !uncalculated_lower_bound_ref.starts_with(&self.branch_path) &&
-                uncalculated_lower_bound_ref > &self.branch_path
-            {
-                // The lower bound has moved entirely past this branch (e.g. branch is 0x6 but
-                // lower is 0x7). All remaining children have been processed.
-                next_child_nibbles = TrieMask::default();
-                trace!(
-                    target: TRACE_TARGET,
-                    branch_path = ?self.branch_path,
-                    ?_orig_next_child_nibbles,
-                    ?next_child_nibbles,
-                    "Unset all nibbles from next_child_nibbles due to branch_path being outside this subtrie",
-                );
+            match lower_bound_relation {
+                PathPrefixRelation::WithinPrefix { next_nibble } => {
+                    // Clear all nibbles strictly below `next_nibble` since they've been processed.
+                    let already_processed_mask = TrieMask::new((1u16 << next_nibble) - 1);
+                    next_child_nibbles &= !already_processed_mask;
+                    trace!(
+                        target: TRACE_TARGET,
+                        branch_path = ?branch_path,
+                        ?_orig_next_child_nibbles,
+                        ?already_processed_mask,
+                        ?next_child_nibbles,
+                        "Unset already processed key nibbles from next_child_nibbles",
+                    );
+                }
+                PathPrefixRelation::AfterPrefix => {
+                    // The lower bound has moved entirely past this branch (e.g. branch is 0x6 but
+                    // lower is 0x7). All remaining children have been processed.
+                    next_child_nibbles = TrieMask::default();
+                    trace!(
+                        target: TRACE_TARGET,
+                        branch_path = ?branch_path,
+                        ?_orig_next_child_nibbles,
+                        ?next_child_nibbles,
+                        "Unset all nibbles from next_child_nibbles due to branch_path being outside this subtrie",
+                    );
+                }
+                PathPrefixRelation::BeforePrefix | PathPrefixRelation::AtPrefix => {}
             }
 
             // If there are no further children to construct for this branch then pop it off both
@@ -1178,7 +1182,7 @@ where
             // any dirty leaves between that path and this child, it indicates there may be leaves
             // which would split that extension node. In that case we return the range to process
             // the leaves.
-            if uncalculated_lower_bound_ref < &child_path &&
+            if lower_bound_relation.is_before_child(child_nibble) &&
                 self.prefix_set.contains_range(uncalculated_lower_bound_ref..&child_path)
             {
                 self.cached_branch_stack.push((cached_path, cached_branch));
@@ -1244,7 +1248,10 @@ where
 
             // All trie nodes prior to `child_path` will not be modified further, so we can seek the
             // trie cursor to the next cached node at-or-after `child_path`.
-            if trie_cursor_state.path().is_some_and(|path| path < &child_path) {
+            if trie_cursor_state
+                .path()
+                .is_some_and(|path| PathPrefixRelation::new(path, &child_path).is_before_prefix())
+            {
                 trace!(target: TRACE_TARGET, ?child_path, "Seeking trie cursor to child path");
                 *trie_cursor_state = TrieCursorState::seeked(self.trie_cursor_seek(child_path)?);
             }
@@ -1728,6 +1735,57 @@ impl<'a> TargetsCursor<'a> {
     /// current.
     fn rev_iter(&self) -> impl Iterator<Item = &'a ProofV2Target> {
         self.targets[..self.i].iter().rev()
+    }
+}
+
+/// Caches how a path sits relative to a prefix so hot proof-v2 loops can avoid repeated full
+/// `Nibbles::cmp` calls for the same pair of paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathPrefixRelation {
+    BeforePrefix,
+    AtPrefix,
+    WithinPrefix { next_nibble: u8 },
+    AfterPrefix,
+}
+
+impl PathPrefixRelation {
+    #[inline]
+    fn new(path: &Nibbles, prefix: &Nibbles) -> Self {
+        let prefix_len = prefix.len();
+        if path.starts_with(prefix) {
+            return if path.len() == prefix_len {
+                Self::AtPrefix
+            } else {
+                Self::WithinPrefix { next_nibble: path.get_unchecked(prefix_len) }
+            }
+        }
+
+        let common_prefix_len = path.common_prefix_length(prefix);
+        if common_prefix_len == path.len() {
+            debug_assert!(path.len() < prefix_len);
+            return Self::BeforePrefix
+        }
+
+        debug_assert!(common_prefix_len < prefix_len);
+        if path.get_unchecked(common_prefix_len) < prefix.get_unchecked(common_prefix_len) {
+            Self::BeforePrefix
+        } else {
+            Self::AfterPrefix
+        }
+    }
+
+    #[inline]
+    const fn is_before_prefix(self) -> bool {
+        matches!(self, Self::BeforePrefix)
+    }
+
+    #[inline]
+    const fn is_before_child(self, child_nibble: u8) -> bool {
+        match self {
+            Self::BeforePrefix | Self::AtPrefix => true,
+            Self::WithinPrefix { next_nibble } => next_nibble < child_nibble,
+            Self::AfterPrefix => false,
+        }
     }
 }
 
