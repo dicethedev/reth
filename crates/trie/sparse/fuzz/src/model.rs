@@ -1,6 +1,5 @@
 use alloy_primitives::{B256, U256, map::B256Map};
 use rand::{Rng, SeedableRng, rngs::StdRng};
-use reth_trie_common::ProofV2Target;
 use reth_trie_sparse::{LeafUpdate, SparseTrie};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -180,18 +179,4 @@ pub fn collect_proof_requests<T: SparseTrie>(
     })
     .expect("update_leaves should succeed");
     requests
-}
-
-/// Merge proof requests from both implementations, keeping the smaller min_len per key.
-pub fn merge_requests(a: Vec<(B256, u8)>, b: Vec<(B256, u8)>) -> Vec<ProofV2Target> {
-    let mut min_len_by_key = B256Map::<u8>::default();
-
-    for (key, min_len) in a.into_iter().chain(b) {
-        min_len_by_key.entry(key).and_modify(|v| *v = (*v).min(min_len)).or_insert(min_len);
-    }
-
-    min_len_by_key
-        .into_iter()
-        .map(|(key, min_len)| ProofV2Target::new(key).with_min_len(min_len))
-        .collect()
 }

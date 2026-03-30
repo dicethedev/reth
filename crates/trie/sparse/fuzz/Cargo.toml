@@ -21,8 +21,15 @@ alloy-rlp = { version = "0.3", default-features = false, features = ["std"] }
 rand = "0.9"
 
 [[bin]]
-name = "swarm_sparse_trie"
-path = "fuzz_targets/swarm_sparse_trie.rs"
+name = "swarm_sparse_trie_arena"
+path = "fuzz_targets/swarm_sparse_trie_arena.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "swarm_sparse_trie_map"
+path = "fuzz_targets/swarm_sparse_trie_map.rs"
 test = false
 doc = false
 bench = false

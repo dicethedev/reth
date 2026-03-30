@@ -1,5 +1,10 @@
-use reth_trie_sparse_fuzz::driver::run;
+use reth_trie_sparse_fuzz::driver::{run_arena, run_map};
 use reth_trie_sparse_fuzz::input::*;
+
+fn assert_runs_on_both(input: FuzzInput) {
+    run_arena(input.clone());
+    run_map(input);
+}
 
 #[test]
 fn smoke_low1_two_prefixes() {
@@ -34,7 +39,7 @@ fn smoke_low1_two_prefixes() {
             ],
         }],
     };
-    run(input);
+    assert_runs_on_both(input);
 }
 
 #[test]
@@ -70,7 +75,7 @@ fn smoke_serial256_scattered() {
             ],
         }],
     };
-    run(input);
+    assert_runs_on_both(input);
 }
 
 #[test]
@@ -106,7 +111,7 @@ fn smoke_boundary4_single_prefix() {
             ],
         }],
     };
-    run(input);
+    assert_runs_on_both(input);
 }
 
 #[test]
@@ -141,5 +146,5 @@ fn smoke_small_sticky_with_mid_round_checkpoint() {
             ],
         }],
     };
-    run(input);
+    assert_runs_on_both(input);
 }

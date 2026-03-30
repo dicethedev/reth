@@ -1,15 +1,16 @@
+use alloy_primitives::map::B256Map;
 use rand::{SeedableRng, rngs::StdRng};
 use reth_trie::test_utils::TrieTestHarness;
-use reth_trie_common::Nibbles;
+use reth_trie_common::{Nibbles, ProofV2Target};
 use reth_trie_sparse::{
-    ArenaParallelSparseTrie, ArenaParallelismThresholds, ParallelSparseTrie,
+    ArenaParallelSparseTrie, ArenaParallelismThresholds, LeafUpdate, ParallelSparseTrie,
     ParallelismThresholds, SparseTrie,
 };
 
 use crate::input::{BlockSpec, FuzzInput, RoundOp, ThresholdProfile};
 use crate::model::{
-    apply_changeset_to_live_state, build_initial_storage, choose_retained_keys,
-    collect_proof_requests, merge_requests, realize_block,
+    apply_changeset_to_live_state, build_initial_storage, choose_retained_keys, collect_proof_requests,
+    realize_block,
 };
 use crate::pools::KeyPools;
 
@@ -19,9 +20,26 @@ const MAX_RETRY_ITERS: usize = 64;
 const MIN_ROUND_OPS: usize = 3;
 const MAX_ROUND_OPS: usize = 10;
 
-/// Main fuzzer entry point. Drives both SparseTrie implementations through
-/// the same multi-block lifecycle and asserts they agree on roots.
-pub fn run(input: FuzzInput) {
+/// Fuzzer entry point for the arena-backed sparse trie.
+pub fn run_arena(input: FuzzInput) {
+    run_with_trie(input, |profile| {
+        ArenaParallelSparseTrie::default()
+            .with_parallelism_thresholds(materialize_arena_thresholds(profile))
+    }, "arena");
+}
+
+/// Fuzzer entry point for the map-backed sparse trie.
+pub fn run_map(input: FuzzInput) {
+    run_with_trie(input, |profile| {
+        ParallelSparseTrie::default().with_parallelism_thresholds(materialize_map_thresholds(profile))
+    }, "map");
+}
+
+fn run_with_trie<T, F>(input: FuzzInput, make_trie: F, trie_label: &str)
+where
+    T: SparseTrie,
+    F: FnOnce(ThresholdProfile) -> T,
+{
     let round_count = 20 + (input.round_count as usize % 81);
 
     // Early exit if no rounds specified (libfuzzer can generate empty vecs).
@@ -40,20 +58,10 @@ pub fn run(input: FuzzInput) {
 
     // 2. Root-only reveal — maximally blinded start.
     let root_node = harness.root_node();
+    let mut trie = make_trie(input.profile);
 
-    let (arena_thresholds, map_thresholds) = materialize_thresholds(input.profile);
-
-    let mut arena = ArenaParallelSparseTrie::default()
-        .with_parallelism_thresholds(arena_thresholds);
-    let mut map_trie = ParallelSparseTrie::default()
-        .with_parallelism_thresholds(map_thresholds);
-
-    arena
-        .set_root(root_node.node.clone(), root_node.masks, false)
-        .expect("arena set_root should succeed");
-    map_trie
-        .set_root(root_node.node, root_node.masks, false)
-        .expect("map set_root should succeed");
+    trie.set_root(root_node.node, root_node.masks, false)
+        .unwrap_or_else(|err| panic!("{trie_label} set_root should succeed: {err}"));
 
     let mut pools = KeyPools::from_storage(&live_state);
 
@@ -64,8 +72,7 @@ pub fn run(input: FuzzInput) {
         // Build one production-like small block.
         let crate::model::RealizedBlock { leaf_updates, changeset, touched_keys } =
             realize_block(spec, &live_state, &mut pools);
-        let mut pending_arena = leaf_updates.clone();
-        let mut pending_map = leaf_updates;
+        let mut pending = leaf_updates;
         let mut pending_changeset = Some(changeset);
 
         let mut updates_applied = false;
@@ -79,13 +86,12 @@ pub fn run(input: FuzzInput) {
             match op {
                 RoundOp::ApplyUpdates => {
                     apply_pending_updates(
-                        &mut arena,
-                        &mut map_trie,
+                        &mut trie,
                         &mut harness,
-                        &mut pending_arena,
-                        &mut pending_map,
+                        &mut pending,
                         round_idx,
                         op_idx,
+                        trie_label,
                     );
 
                     if !updates_applied {
@@ -100,7 +106,7 @@ pub fn run(input: FuzzInput) {
                 }
                 RoundOp::Prune => {
                     if !roots_fresh_since_last_apply {
-                        checkpoint_roots(&mut arena, &mut map_trie, &harness, round_idx, Some(op_idx));
+                        checkpoint_root(&mut trie, &harness, round_idx, Some(op_idx), trie_label);
                         roots_fresh_since_last_apply = true;
                     }
 
@@ -121,14 +127,13 @@ pub fn run(input: FuzzInput) {
                     retained_paths.sort_unstable();
                     retained_paths.dedup();
 
-                    arena.prune(&retained_paths);
-                    map_trie.prune(&retained_paths);
+                    trie.prune(&retained_paths);
 
                     pools.observe_prune(&touched_keys, &retained, &live_state);
                     pruned_this_round = true;
                 }
                 RoundOp::CheckpointRoot => {
-                    checkpoint_roots(&mut arena, &mut map_trie, &harness, round_idx, Some(op_idx));
+                    checkpoint_root(&mut trie, &harness, round_idx, Some(op_idx), trie_label);
                     roots_fresh_since_last_apply = true;
                 }
             }
@@ -137,13 +142,12 @@ pub fn run(input: FuzzInput) {
         // Ensure rounds eventually apply updates even if the op schedule omitted ApplyUpdates.
         if !updates_applied {
             apply_pending_updates(
-                &mut arena,
-                &mut map_trie,
+                &mut trie,
                 &mut harness,
-                &mut pending_arena,
-                &mut pending_map,
+                &mut pending,
                 round_idx,
                 usize::MAX,
+                trie_label,
             );
 
             let changeset =
@@ -155,7 +159,7 @@ pub fn run(input: FuzzInput) {
 
         // Always checkpoint at end of round to keep strong invariants regardless of op schedule.
         if updates_applied {
-            checkpoint_roots(&mut arena, &mut map_trie, &harness, round_idx, None);
+            checkpoint_root(&mut trie, &harness, round_idx, None, trie_label);
         }
 
         if !pruned_this_round {
@@ -178,89 +182,78 @@ fn materialize_round_ops(spec: &BlockSpec) -> Vec<RoundOp> {
     spec.ops.iter().copied().cycle().take(op_count).collect()
 }
 
-fn apply_pending_updates(
-    arena: &mut ArenaParallelSparseTrie,
-    map_trie: &mut ParallelSparseTrie,
+fn apply_pending_updates<T: SparseTrie>(
+    trie: &mut T,
     harness: &mut TrieTestHarness,
-    pending_arena: &mut alloy_primitives::map::B256Map<reth_trie_sparse::LeafUpdate>,
-    pending_map: &mut alloy_primitives::map::B256Map<reth_trie_sparse::LeafUpdate>,
+    pending: &mut B256Map<LeafUpdate>,
     round_idx: usize,
     op_idx: usize,
+    trie_label: &str,
 ) {
     for _ in 0..MAX_RETRY_ITERS {
-        let arena_requests = collect_proof_requests(arena, pending_arena);
-        let map_requests = collect_proof_requests(map_trie, pending_map);
-
-        let mut targets = merge_requests(arena_requests, map_requests);
+        let requests = collect_proof_requests(trie, pending);
+        let mut targets: Vec<ProofV2Target> = requests
+            .into_iter()
+            .map(|(key, min_len)| ProofV2Target::new(key).with_min_len(min_len))
+            .collect();
         if targets.is_empty() {
             break;
         }
 
         let (mut proof_nodes, _) = harness.proof_v2(&mut targets);
 
-        // reveal_nodes mutates the slice, so clone for the second implementation.
-        let mut proof_nodes_for_map = proof_nodes.clone();
-
-        arena.reveal_nodes(&mut proof_nodes).expect("arena reveal_nodes should succeed");
-        map_trie
-            .reveal_nodes(&mut proof_nodes_for_map)
-            .expect("map reveal_nodes should succeed");
+        trie.reveal_nodes(&mut proof_nodes)
+            .unwrap_or_else(|err| panic!("{trie_label} reveal_nodes should succeed: {err}"));
     }
 
     assert!(
-        pending_arena.is_empty(),
-        "arena has pending updates after retry budget (round {round_idx}, op {op_idx})"
-    );
-    assert!(
-        pending_map.is_empty(),
-        "map has pending updates after retry budget (round {round_idx}, op {op_idx})"
+        pending.is_empty(),
+        "{trie_label} has pending updates after retry budget (round {round_idx}, op {op_idx})"
     );
 }
 
-fn checkpoint_roots(
-    arena: &mut ArenaParallelSparseTrie,
-    map_trie: &mut ParallelSparseTrie,
+fn checkpoint_root<T: SparseTrie>(
+    trie: &mut T,
     harness: &TrieTestHarness,
     round_idx: usize,
     op_idx: Option<usize>,
+    trie_label: &str,
 ) {
-    let arena_root = arena.root();
-    let map_root = map_trie.root();
+    let trie_root = trie.root();
     let expected_root = harness.original_root();
 
     let phase = op_idx.map_or_else(|| "end".to_string(), |idx| format!("op {idx}"));
     assert_eq!(
-        arena_root, map_root,
-        "impl divergence at round {round_idx} ({phase}): arena={arena_root} map={map_root}"
-    );
-    assert_eq!(
-        arena_root, expected_root,
-        "oracle mismatch at round {round_idx} ({phase}): arena={arena_root} expected={expected_root}"
+        trie_root, expected_root,
+        "oracle mismatch at round {round_idx} ({phase}): {trie_label}={trie_root} expected={expected_root}"
     );
 }
 
-/// Convert a threshold profile into concrete thresholds for both implementations.
-fn materialize_thresholds(
-    profile: ThresholdProfile,
-) -> (ArenaParallelismThresholds, ParallelismThresholds) {
-    let val = match profile {
+const fn threshold_value(profile: ThresholdProfile) -> usize {
+    match profile {
         ThresholdProfile::Serial256 => 256,
         ThresholdProfile::Low1 => 1,
         ThresholdProfile::Boundary4 => 4,
         ThresholdProfile::Boundary8 => 8,
-    };
+    }
+}
 
-    let arena = ArenaParallelismThresholds {
+fn materialize_arena_thresholds(profile: ThresholdProfile) -> ArenaParallelismThresholds {
+    let val = threshold_value(profile);
+
+    ArenaParallelismThresholds {
         min_dirty_leaves: val as u64,
         min_revealed_nodes: val,
         min_updates: val,
         min_leaves_for_prune: val as u64,
-    };
+    }
+}
 
-    let map = ParallelismThresholds {
+fn materialize_map_thresholds(profile: ThresholdProfile) -> ParallelismThresholds {
+    let val = threshold_value(profile);
+
+    ParallelismThresholds {
         min_revealed_nodes: val,
         min_updated_nodes: val,
-    };
-
-    (arena, map)
+    }
 }
