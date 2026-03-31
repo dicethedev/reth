@@ -704,8 +704,17 @@ impl RocksDBProvider {
     /// Returns a read-only, point-in-time snapshot of the database.
     ///
     /// Lighter weight than [`RocksTx`] — no write-conflict tracking, and `Send + Sync`.
-    pub fn snapshot(&self) -> RocksReadSnapshot<'_> {
-        RocksReadSnapshot { inner: self.0.snapshot(), provider: self }
+    pub fn snapshot(&self) -> RocksReadSnapshot {
+        // SAFETY: the snapshot borrows the underlying RocksDB handle stored inside the provider's
+        // `Arc`. Cloning the provider keeps that allocation alive for the lifetime of the snapshot,
+        // and `RocksReadSnapshot` drops `inner` before `provider`.
+        let inner = unsafe {
+            std::mem::transmute::<RocksReadSnapshotInner<'_>, RocksReadSnapshotInner<'static>>(
+                self.0.snapshot(),
+            )
+        };
+
+        RocksReadSnapshot { inner, provider: self.clone() }
     }
 
     /// Creates a new transaction with MDBX-like semantics (read-your-writes, rollback).
@@ -1378,9 +1387,11 @@ impl RocksDBProvider {
 /// used by [`EitherReader::RocksDB`](crate::either_writer::EitherReader) for history lookups.
 ///
 /// Lighter weight than [`RocksTx`] — no transaction overhead, no write support.
-pub struct RocksReadSnapshot<'db> {
-    inner: RocksReadSnapshotInner<'db>,
-    provider: &'db RocksDBProvider,
+pub struct RocksReadSnapshot {
+    // `inner` must drop before `provider` so the borrowed RocksDB snapshot is released before the
+    // cloned provider keeping the DB alive goes away.
+    inner: RocksReadSnapshotInner<'static>,
+    provider: RocksDBProvider,
 }
 
 /// Inner enum to hold the snapshot for either read-write or read-only mode.
@@ -1401,7 +1412,7 @@ impl<'db> RocksReadSnapshotInner<'db> {
     }
 }
 
-impl fmt::Debug for RocksReadSnapshot<'_> {
+impl fmt::Debug for RocksReadSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RocksReadSnapshot")
             .field("provider", &self.provider)
@@ -1409,9 +1420,9 @@ impl fmt::Debug for RocksReadSnapshot<'_> {
     }
 }
 
-impl<'db> RocksReadSnapshot<'db> {
+impl RocksReadSnapshot {
     /// Gets the column family handle for a table.
-    fn cf_handle<T: Table>(&self) -> Result<&'db rocksdb::ColumnFamily, DatabaseError> {
+    fn cf_handle<T: Table>(&self) -> Result<&rocksdb::ColumnFamily, DatabaseError> {
         self.provider.get_cf_handle::<T>()
     }
 
@@ -3034,6 +3045,33 @@ mod tests {
 
         let result = ro_provider.snapshot().account_history_info(address, 400, None).unwrap();
         assert_eq!(result, HistoryInfo::InPlainState);
+    }
+
+    #[test]
+    fn test_snapshot_stays_pinned_after_later_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let provider = RocksDBBuilder::new(temp_dir.path()).with_default_tables().build().unwrap();
+
+        let address = Address::from([0x42; 20]);
+
+        let mut batch = provider.batch();
+        batch.append_account_history_shard(address, vec![100]).unwrap();
+        batch.commit().unwrap();
+
+        let pinned_snapshot = provider.snapshot();
+
+        let mut batch = provider.batch();
+        batch.append_account_history_shard(address, vec![200]).unwrap();
+        batch.commit().unwrap();
+
+        assert_eq!(
+            pinned_snapshot.account_history_info(address, 150, None).unwrap(),
+            HistoryInfo::InPlainState
+        );
+        assert_eq!(
+            provider.snapshot().account_history_info(address, 150, None).unwrap(),
+            HistoryInfo::InChangeset(200)
+        );
     }
 
     #[test]
