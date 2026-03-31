@@ -128,7 +128,7 @@ pub struct HistoricalStateProviderRef<'b, Provider> {
     block_number: BlockNumber,
     /// Lowest blocks at which different parts of the state are available.
     lowest_available_blocks: LowestAvailableBlocks,
-    /// Pinned RocksDB snapshot taken alongside the MDBX read transaction.
+    /// Pinned `RocksDB` snapshot taken alongside the MDBX read transaction.
     pinned_rocksdb_snapshot: Option<&'b RocksReadSnapshot>,
 }
 
@@ -155,7 +155,10 @@ impl<'b, Provider: DBProvider + ChangeSetReader + StorageChangeSetReader + Block
         Self { provider, block_number, lowest_available_blocks, pinned_rocksdb_snapshot: None }
     }
 
-    pub(crate) fn with_pinned_rocksdb_snapshot(mut self, snapshot: &'b RocksReadSnapshot) -> Self {
+    pub(crate) const fn with_pinned_rocksdb_snapshot(
+        mut self,
+        snapshot: &'b RocksReadSnapshot,
+    ) -> Self {
         self.pinned_rocksdb_snapshot = Some(snapshot);
         self
     }
@@ -608,7 +611,7 @@ pub struct HistoricalStateProvider<Provider> {
     block_number: BlockNumber,
     /// Lowest blocks at which different parts of the state are available.
     lowest_available_blocks: LowestAvailableBlocks,
-    /// Pinned RocksDB snapshot taken alongside the MDBX read transaction.
+    /// Pinned `RocksDB` snapshot taken alongside the MDBX read transaction.
     pinned_rocksdb_snapshot: Option<RocksReadSnapshot>,
 }
 
@@ -650,7 +653,7 @@ impl<Provider: DBProvider + ChangeSetReader + StorageChangeSetReader + BlockNumR
 
     /// Returns a new provider that takes the `TX` as reference
     #[inline(always)]
-    fn as_ref(&self) -> HistoricalStateProviderRef<'_, Provider> {
+    const fn as_ref(&self) -> HistoricalStateProviderRef<'_, Provider> {
         let provider = HistoricalStateProviderRef::new_with_lowest_available_blocks(
             &self.provider,
             self.block_number,

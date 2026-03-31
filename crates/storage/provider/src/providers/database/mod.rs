@@ -239,12 +239,12 @@ impl<N: ProviderNodeTypes<DB = DatabaseEnv>> ProviderFactory<N> {
 }
 
 impl<N: ProviderNodeTypes> ProviderFactory<N> {
-    /// Opens a read-only MDBX transaction and, for `storage_v2`, pins a matching RocksDB
+    /// Opens a read-only MDBX transaction and, for `storage_v2`, pins a matching `RocksDB`
     /// snapshot.
     ///
     /// The helper retries if an MDBX write commit lands between opening the read transaction and
-    /// taking the RocksDB snapshot. This keeps both stores aligned for historical reads that span
-    /// MDBX state and RocksDB history indices.
+    /// taking the `RocksDB` snapshot. This keeps both stores aligned for historical reads that
+    /// span MDBX state and `RocksDB` history indices.
     fn read_tx_and_rocksdb_snapshot(
         &self,
     ) -> ProviderResult<(<N::DB as Database>::TX, Option<RocksReadSnapshot>)> {

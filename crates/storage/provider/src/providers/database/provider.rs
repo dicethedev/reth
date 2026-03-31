@@ -212,7 +212,7 @@ pub struct DatabaseProvider<TX, N: NodeTypes> {
     minimum_pruning_distance: u64,
     /// Database provider metrics
     metrics: metrics::DatabaseProviderMetrics,
-    /// Pinned RocksDB snapshot taken alongside the MDBX read transaction.
+    /// Pinned `RocksDB` snapshot taken alongside the MDBX read transaction.
     pinned_rocksdb_snapshot: Option<RocksReadSnapshot>,
 }
 
@@ -253,11 +253,11 @@ impl<TX, N: NodeTypes> DatabaseProvider<TX, N> {
         self
     }
 
-    pub(crate) fn pinned_rocksdb_snapshot(&self) -> Option<&RocksReadSnapshot> {
+    pub(crate) const fn pinned_rocksdb_snapshot(&self) -> Option<&RocksReadSnapshot> {
         self.pinned_rocksdb_snapshot.as_ref()
     }
 
-    fn take_pinned_rocksdb_snapshot(&mut self) -> Option<RocksReadSnapshot> {
+    const fn take_pinned_rocksdb_snapshot(&mut self) -> Option<RocksReadSnapshot> {
         self.pinned_rocksdb_snapshot.take()
     }
 }
