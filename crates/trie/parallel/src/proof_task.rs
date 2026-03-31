@@ -30,12 +30,11 @@
 
 use crate::{
     root::ParallelStateRootError,
-    targets_v2::MultiProofTargetsV2,
     value_encoder::{AsyncAccountValueEncoder, ValueEncoderStats},
 };
 use alloy_primitives::{
     map::{B256Map, B256Set},
-    B256,
+    B256, U256,
 };
 use crossbeam_channel::{unbounded, Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use reth_execution_errors::{SparseTrieError, SparseTrieErrorKind, StateProofError};
@@ -44,11 +43,12 @@ use reth_provider::{DatabaseProviderROFactory, ProviderError, ProviderResult};
 use reth_storage_errors::db::DatabaseError;
 use reth_tasks::Runtime;
 use reth_trie::{
-    hashed_cursor::HashedCursorFactory,
+    hashed_cursor::{HashedCursorFactory, HashedStorageCursor, InstrumentedHashedCursor},
     proof::{ProofBlindedAccountProvider, ProofBlindedStorageProvider},
     proof_v2,
-    trie_cursor::TrieCursorFactory,
-    DecodedMultiProofV2, HashedPostState, Nibbles, ProofTrieNodeV2,
+    trie_cursor::{InstrumentedTrieCursor, TrieCursorFactory, TrieStorageCursor},
+    DecodedMultiProofV2, HashedPostState, MultiProofTargetsV2, Nibbles, ProofTrieNodeV2,
+    ProofV2Target,
 };
 use reth_trie_sparse::provider::{RevealedNode, TrieNodeProvider, TrieNodeProviderFactory};
 use std::{
@@ -70,20 +70,20 @@ use crate::proof_task_metrics::{
 
 type TrieNodeProviderResult = Result<Option<RevealedNode>, SparseTrieError>;
 
-/// Type alias for the V2 account proof calculator.
+/// Type alias for the V2 account proof calculator with instrumented cursors.
 type V2AccountProofCalculator<'a, Provider> = proof_v2::ProofCalculator<
-    <Provider as TrieCursorFactory>::AccountTrieCursor<'a>,
-    <Provider as HashedCursorFactory>::AccountCursor<'a>,
+    InstrumentedTrieCursor<'a, <Provider as TrieCursorFactory>::AccountTrieCursor<'a>>,
+    InstrumentedHashedCursor<'a, <Provider as HashedCursorFactory>::AccountCursor<'a>>,
     AsyncAccountValueEncoder<
-        <Provider as TrieCursorFactory>::StorageTrieCursor<'a>,
-        <Provider as HashedCursorFactory>::StorageCursor<'a>,
+        InstrumentedTrieCursor<'a, <Provider as TrieCursorFactory>::StorageTrieCursor<'a>>,
+        InstrumentedHashedCursor<'a, <Provider as HashedCursorFactory>::StorageCursor<'a>>,
     >,
 >;
 
-/// Type alias for the V2 storage proof calculator.
+/// Type alias for the V2 storage proof calculator with instrumented cursors.
 type V2StorageProofCalculator<'a, Provider> = proof_v2::StorageProofCalculator<
-    <Provider as TrieCursorFactory>::StorageTrieCursor<'a>,
-    <Provider as HashedCursorFactory>::StorageCursor<'a>,
+    InstrumentedTrieCursor<'a, <Provider as TrieCursorFactory>::StorageTrieCursor<'a>>,
+    InstrumentedHashedCursor<'a, <Provider as HashedCursorFactory>::StorageCursor<'a>>,
 >;
 
 /// A handle that provides type-safe access to proof worker pools.
@@ -166,7 +166,7 @@ impl ProofWorkerHandle {
         let storage_avail = storage_available_workers.clone();
         let storage_roots = cached_storage_roots.clone();
         let storage_parent_span = tracing::Span::current();
-        runtime.spawn_blocking(move || {
+        runtime.spawn_blocking_named("storage-workers", move || {
             let worker_id = AtomicUsize::new(0);
             storage_rt.proof_storage_worker_pool().broadcast(storage_worker_count, |_| {
                 let worker_id = worker_id.fetch_add(1, Ordering::Relaxed);
@@ -204,7 +204,7 @@ impl ProofWorkerHandle {
         let account_tx = storage_work_tx.clone();
         let account_avail = account_available_workers.clone();
         let account_parent_span = tracing::Span::current();
-        runtime.spawn_blocking(move || {
+        runtime.spawn_blocking_named("account-workers", move || {
             let worker_id = AtomicUsize::new(0);
             account_rt.proof_account_worker_pool().broadcast(account_worker_count, |_| {
                 let worker_id = worker_id.fetch_add(1, Ordering::Relaxed);
@@ -384,12 +384,26 @@ impl ProofWorkerHandle {
 pub struct ProofTaskCtx<Factory> {
     /// The factory for creating state providers.
     factory: Factory,
+    /// Maximum random jitter to apply before each proof computation (trie-debug only).
+    #[cfg(feature = "trie-debug")]
+    proof_jitter: Option<Duration>,
 }
 
 impl<Factory> ProofTaskCtx<Factory> {
     /// Creates a new [`ProofTaskCtx`] with the given factory.
     pub const fn new(factory: Factory) -> Self {
-        Self { factory }
+        Self {
+            factory,
+            #[cfg(feature = "trie-debug")]
+            proof_jitter: None,
+        }
+    }
+
+    /// Sets the maximum proof jitter duration (trie-debug only).
+    #[cfg(feature = "trie-debug")]
+    pub const fn with_proof_jitter(mut self, jitter: Option<Duration>) -> Self {
+        self.proof_jitter = jitter;
+        self
     }
 }
 
@@ -414,14 +428,15 @@ impl<Provider> ProofTaskTx<Provider>
 where
     Provider: TrieCursorFactory + HashedCursorFactory,
 {
-    fn compute_v2_storage_proof(
+    fn compute_v2_storage_proof<TC, HC>(
         &self,
         input: StorageProofInput,
-        calculator: &mut proof_v2::StorageProofCalculator<
-            <Provider as TrieCursorFactory>::StorageTrieCursor<'_>,
-            <Provider as HashedCursorFactory>::StorageCursor<'_>,
-        >,
-    ) -> Result<StorageProofResult, StateProofError> {
+        calculator: &mut proof_v2::StorageProofCalculator<TC, HC>,
+    ) -> Result<StorageProofResult, StateProofError>
+    where
+        TC: TrieStorageCursor,
+        HC: HashedStorageCursor<Value = U256>,
+    {
         let StorageProofInput { hashed_address, mut targets } = input;
 
         let span = debug_span!(
@@ -692,8 +707,16 @@ where
         let mut cursor_metrics_cache = ProofTaskCursorMetricsCache::default();
         let trie_cursor = proof_tx.provider.storage_trie_cursor(B256::ZERO)?;
         let hashed_cursor = proof_tx.provider.hashed_storage_cursor(B256::ZERO)?;
-        let mut v2_calculator =
-            proof_v2::StorageProofCalculator::new_storage(trie_cursor, hashed_cursor);
+        let instrumented_trie_cursor =
+            InstrumentedTrieCursor::new(trie_cursor, &mut cursor_metrics_cache.storage_trie_cursor);
+        let instrumented_hashed_cursor = InstrumentedHashedCursor::new(
+            hashed_cursor,
+            &mut cursor_metrics_cache.storage_hashed_cursor,
+        );
+        let mut v2_calculator = proof_v2::StorageProofCalculator::new_storage(
+            instrumented_trie_cursor,
+            instrumented_hashed_cursor,
+        );
 
         // Initially mark this worker as available.
         self.available_workers.fetch_add(1, Ordering::Relaxed);
@@ -706,6 +729,19 @@ where
 
             // Mark worker as busy.
             self.available_workers.fetch_sub(1, Ordering::Relaxed);
+
+            #[cfg(feature = "trie-debug")]
+            if let Some(max_jitter) = self.task_ctx.proof_jitter {
+                let jitter =
+                    Duration::from_nanos(rand::random_range(0..=max_jitter.as_nanos() as u64));
+                trace!(
+                    target: "trie::proof_task",
+                    worker_id = self.worker_id,
+                    jitter_us = jitter.as_micros(),
+                    "Storage worker applying proof jitter"
+                );
+                std::thread::sleep(jitter);
+            }
 
             match job {
                 StorageWorkerJob::StorageProof { input, proof_result_sender } => {
@@ -736,6 +772,9 @@ where
             idle_start = Instant::now();
         }
 
+        // Drop calculator to release mutable borrows on cursor_metrics_cache.
+        drop(v2_calculator);
+
         trace!(
             target: "trie::proof_task",
             worker_id = self.worker_id,
@@ -756,18 +795,17 @@ where
     }
 
     /// Processes a storage proof request.
-    fn process_storage_proof<Provider>(
+    fn process_storage_proof<Provider, TC, HC>(
         &self,
         proof_tx: &ProofTaskTx<Provider>,
-        v2_calculator: &mut proof_v2::StorageProofCalculator<
-            <Provider as TrieCursorFactory>::StorageTrieCursor<'_>,
-            <Provider as HashedCursorFactory>::StorageCursor<'_>,
-        >,
+        v2_calculator: &mut proof_v2::StorageProofCalculator<TC, HC>,
         input: StorageProofInput,
         proof_result_sender: CrossbeamSender<StorageProofResultMessage>,
         storage_proofs_processed: &mut u64,
     ) where
         Provider: TrieCursorFactory + HashedCursorFactory,
+        TC: TrieStorageCursor,
+        HC: HashedStorageCursor<Value = U256>,
     {
         let hashed_address = input.hashed_address;
         let proof_start = Instant::now();
@@ -953,18 +991,42 @@ where
         let storage_trie_cursor = provider.storage_trie_cursor(B256::ZERO)?;
         let storage_hashed_cursor = provider.hashed_storage_cursor(B256::ZERO)?;
 
-        let mut v2_account_calculator = proof_v2::ProofCalculator::<
-            _,
-            _,
-            AsyncAccountValueEncoder<
-                <Factory::Provider as TrieCursorFactory>::StorageTrieCursor<'_>,
-                <Factory::Provider as HashedCursorFactory>::StorageCursor<'_>,
-            >,
-        >::new(account_trie_cursor, account_hashed_cursor);
+        let instrumented_account_trie_cursor = InstrumentedTrieCursor::new(
+            account_trie_cursor,
+            &mut cursor_metrics_cache.account_trie_cursor,
+        );
+        let instrumented_account_hashed_cursor = InstrumentedHashedCursor::new(
+            account_hashed_cursor,
+            &mut cursor_metrics_cache.account_hashed_cursor,
+        );
+        let instrumented_storage_trie_cursor = InstrumentedTrieCursor::new(
+            storage_trie_cursor,
+            &mut cursor_metrics_cache.storage_trie_cursor,
+        );
+        let instrumented_storage_hashed_cursor = InstrumentedHashedCursor::new(
+            storage_hashed_cursor,
+            &mut cursor_metrics_cache.storage_hashed_cursor,
+        );
+
+        let mut v2_account_calculator =
+            proof_v2::ProofCalculator::<
+                _,
+                _,
+                AsyncAccountValueEncoder<
+                    InstrumentedTrieCursor<
+                        '_,
+                        <Factory::Provider as TrieCursorFactory>::StorageTrieCursor<'_>,
+                    >,
+                    InstrumentedHashedCursor<
+                        '_,
+                        <Factory::Provider as HashedCursorFactory>::StorageCursor<'_>,
+                    >,
+                >,
+            >::new(instrumented_account_trie_cursor, instrumented_account_hashed_cursor);
         let v2_storage_calculator =
             Rc::new(RefCell::new(proof_v2::StorageProofCalculator::new_storage(
-                storage_trie_cursor,
-                storage_hashed_cursor,
+                instrumented_storage_trie_cursor,
+                instrumented_storage_hashed_cursor,
             )));
 
         // Count this worker as available only after successful initialization.
@@ -980,6 +1042,19 @@ where
             // Mark worker as busy.
             self.available_workers.fetch_sub(1, Ordering::Relaxed);
 
+            #[cfg(feature = "trie-debug")]
+            if let Some(max_jitter) = self.task_ctx.proof_jitter {
+                let jitter =
+                    Duration::from_nanos(rand::random_range(0..=max_jitter.as_nanos() as u64));
+                trace!(
+                    target: "trie::proof_task",
+                    worker_id = self.worker_id,
+                    jitter_us = jitter.as_micros(),
+                    "Account worker applying proof jitter"
+                );
+                std::thread::sleep(jitter);
+            }
+
             match job {
                 AccountWorkerJob::AccountMultiproof { input } => {
                     let value_encoder_stats = self.process_account_multiproof::<Factory::Provider>(
@@ -987,7 +1062,6 @@ where
                         v2_storage_calculator.clone(),
                         *input,
                         &mut account_proofs_processed,
-                        &mut cursor_metrics_cache,
                     );
                     total_idle_time += value_encoder_stats.storage_wait_time;
                     value_encoder_stats_cache.extend(&value_encoder_stats);
@@ -1009,6 +1083,10 @@ where
 
             idle_start = Instant::now();
         }
+
+        // Drop calculators to release mutable borrows on cursor_metrics_cache.
+        drop(v2_account_calculator);
+        drop(v2_storage_calculator);
 
         trace!(
             target: "trie::proof_task",
@@ -1079,12 +1157,10 @@ where
         v2_storage_calculator: Rc<RefCell<V2StorageProofCalculator<'a, Provider>>>,
         input: AccountMultiproofInput,
         account_proofs_processed: &mut u64,
-        cursor_metrics_cache: &mut ProofTaskCursorMetricsCache,
     ) -> ValueEncoderStats
     where
         Provider: TrieCursorFactory + HashedCursorFactory + 'a,
     {
-        let proof_cursor_metrics = ProofTaskCursorMetricsCache::default();
         let proof_start = Instant::now();
 
         let AccountMultiproofInput { targets, proof_result_sender } = input;
@@ -1114,27 +1190,13 @@ where
             );
         }
 
-        proof_cursor_metrics.record_spans();
-
         trace!(
             target: "trie::proof_task",
             proof_time_us = proof_elapsed.as_micros(),
             total_elapsed_us = total_elapsed.as_micros(),
             total_processed = account_proofs_processed,
-            account_trie_cursor_duration_us = proof_cursor_metrics.account_trie_cursor.total_duration.as_micros(),
-            account_hashed_cursor_duration_us = proof_cursor_metrics.account_hashed_cursor.total_duration.as_micros(),
-            storage_trie_cursor_duration_us = proof_cursor_metrics.storage_trie_cursor.total_duration.as_micros(),
-            storage_hashed_cursor_duration_us = proof_cursor_metrics.storage_hashed_cursor.total_duration.as_micros(),
-            account_trie_cursor_metrics = ?proof_cursor_metrics.account_trie_cursor,
-            account_hashed_cursor_metrics = ?proof_cursor_metrics.account_hashed_cursor,
-            storage_trie_cursor_metrics = ?proof_cursor_metrics.storage_trie_cursor,
-            storage_hashed_cursor_metrics = ?proof_cursor_metrics.storage_hashed_cursor,
             "Account multiproof completed"
         );
-
-        #[cfg(feature = "metrics")]
-        // Accumulate per-proof metrics into the worker's cache
-        cursor_metrics_cache.extend(&proof_cursor_metrics);
 
         value_encoder_stats
     }
@@ -1196,8 +1258,8 @@ where
 /// Propagates errors up if queuing fails. Receivers must be consumed by the caller.
 fn dispatch_v2_storage_proofs(
     storage_work_tx: &CrossbeamSender<StorageWorkerJob>,
-    account_targets: &[proof_v2::Target],
-    mut storage_targets: B256Map<Vec<proof_v2::Target>>,
+    account_targets: &[ProofV2Target],
+    mut storage_targets: B256Map<Vec<ProofV2Target>>,
 ) -> Result<B256Map<CrossbeamReceiver<StorageProofResultMessage>>, ParallelStateRootError> {
     let mut storage_proof_receivers =
         B256Map::with_capacity_and_hasher(account_targets.len(), Default::default());
@@ -1247,12 +1309,12 @@ pub struct StorageProofInput {
     /// The hashed address for which the proof is calculated.
     pub hashed_address: B256,
     /// The set of proof targets
-    pub targets: Vec<proof_v2::Target>,
+    pub targets: Vec<ProofV2Target>,
 }
 
 impl StorageProofInput {
     /// Creates a new [`StorageProofInput`] with the given hashed address and target slots.
-    pub const fn new(hashed_address: B256, targets: Vec<proof_v2::Target>) -> Self {
+    pub const fn new(hashed_address: B256, targets: Vec<ProofV2Target>) -> Self {
         Self { hashed_address, targets }
     }
 }
