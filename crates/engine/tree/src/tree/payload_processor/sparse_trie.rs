@@ -9,11 +9,11 @@ use crate::tree::{
     },
     payload_processor::multiproof::MultiProofTaskMetrics,
 };
-use alloy_primitives::B256;
+use alloy_primitives::{map::B256Set, B256};
 use alloy_rlp::{Decodable, Encodable};
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use reth_primitives_traits::{Account, FastInstant as Instant};
+use reth_primitives_traits::{dashmap::DashMap, Account, FastInstant as Instant};
 use reth_tasks::Runtime;
 use reth_trie::{
     updates::TrieUpdates, DecodedMultiProofV2, HashedPostState, TrieAccount, EMPTY_ROOT_HASH,
@@ -48,6 +48,8 @@ pub(super) struct SparseTrieCacheTask<A = ConfigurableSparseTrie, S = Configurab
     trie: SparseStateTrie<A, S>,
     /// Handle to the proof worker pools (storage and account).
     proof_worker_handle: ProofWorkerHandle,
+    /// Shared storage-root cache reused across continuation blocks.
+    storage_root_cache: Arc<DashMap<B256, B256>>,
 
     /// The size of proof targets chunk to spawn in one calculation.
     /// If None, chunking is disabled and all targets are processed in a single proof.
@@ -103,6 +105,9 @@ pub(super) struct SparseTrieCacheTask<A = ConfigurableSparseTrie, S = Configurab
     /// Number of pending execution/prewarming updates received but not yet passed to
     /// `update_leaves`.
     pending_updates: usize,
+    /// Accounts whose storage changed in the block and whose final post-block storage roots must
+    /// be published into the preserved cache before reuse.
+    storage_root_dirty_accounts: B256Set,
 
     /// Metrics for the sparse trie.
     metrics: MultiProofTaskMetrics,
@@ -118,6 +123,7 @@ where
         executor: &Runtime,
         updates: CrossbeamReceiver<StateRootMessage>,
         proof_worker_handle: ProofWorkerHandle,
+        storage_root_cache: Arc<DashMap<B256, B256>>,
         metrics: MultiProofTaskMetrics,
         trie: SparseStateTrie<A, S>,
         chunk_size: usize,
@@ -137,6 +143,7 @@ where
             proof_result_rx,
             updates: hashed_state_rx,
             proof_worker_handle,
+            storage_root_cache,
             trie,
             chunk_size,
             max_targets_for_chunking: DEFAULT_MAX_TARGETS_FOR_CHUNKING,
@@ -155,6 +162,7 @@ where
             storage_cache_misses: 0,
             pending_targets: Default::default(),
             pending_updates: Default::default(),
+            storage_root_dirty_accounts: Default::default(),
             metrics,
         }
     }
@@ -363,6 +371,7 @@ where
             self.trie.root_with_updates(&self.proof_worker_handle).map_err(|e| {
                 ParallelStateRootError::Other(format!("could not calculate state root: {e:?}"))
             })?;
+        self.publish_final_storage_roots();
 
         #[cfg(feature = "trie-debug")]
         let debug_recorders = self.trie.take_debug_recorders();
@@ -434,6 +443,8 @@ where
     )]
     fn on_hashed_state_update(&mut self, hashed_state_update: HashedPostState) {
         for (address, storage) in hashed_state_update.storages {
+            self.storage_root_dirty_accounts.insert(address);
+
             if !storage.storage.is_empty() {
                 // Look up outer maps once per address instead of once per slot.
                 let new_updates = self.new_storage_updates.entry(address).or_default();
@@ -487,6 +498,14 @@ where
         self.trie.reveal_decoded_multiproof_v2(result).map_err(|e| {
             ParallelStateRootError::Other(format!("could not reveal multiproof: {e:?}"))
         })
+    }
+
+    fn publish_final_storage_roots(&mut self) {
+        let dirty_accounts = self.storage_root_dirty_accounts.drain().collect::<Vec<_>>();
+        for address in dirty_accounts {
+            let root = self.trie.storage_root(&address).unwrap_or(EMPTY_ROOT_HASH);
+            self.storage_root_cache.insert(address, root);
+        }
     }
 
     fn process_new_updates(&mut self) -> SparseTrieResult<()> {

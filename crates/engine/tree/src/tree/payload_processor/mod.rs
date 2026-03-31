@@ -51,7 +51,9 @@ pub mod prewarm;
 pub mod receipt_root_task;
 pub mod sparse_trie;
 
-use preserved_sparse_trie::{PreservedSparseTrie, SharedPreservedSparseTrie};
+use preserved_sparse_trie::{
+    PreservedStateRootAssets, SharedPreservedStateRootAssets, StorageRootCache,
+};
 
 /// Default node capacity for shrinking the sparse trie. This is used to limit the number of trie
 /// nodes in allocated sparse tries.
@@ -111,10 +113,8 @@ where
     precompile_cache_disabled: bool,
     /// Precompile cache map.
     precompile_cache_map: PrecompileCacheMap<SpecFor<Evm>>,
-    /// A pruned `SparseStateTrie`, kept around as a cache of already revealed trie nodes and to
-    /// re-use allocated memory. Stored with the block hash it was computed for to enable trie
-    /// preservation across sequential payload validations.
-    sparse_state_trie: SharedPreservedSparseTrie,
+    /// Preserved state-root assets reused across sequential payload validations.
+    state_root_assets: SharedPreservedStateRootAssets,
     /// LFU hot-slot capacity: max storage slots retained across prune cycles.
     sparse_trie_max_hot_slots: usize,
     /// LFU hot-account capacity: max account addresses retained across prune cycles.
@@ -152,7 +152,7 @@ where
             disable_state_cache: config.disable_state_cache(),
             precompile_cache_disabled: config.precompile_cache_disabled(),
             precompile_cache_map,
-            sparse_state_trie: SharedPreservedSparseTrie::default(),
+            state_root_assets: SharedPreservedStateRootAssets::default(),
             sparse_trie_max_hot_slots: config.sparse_trie_max_hot_slots(),
             sparse_trie_max_hot_accounts: config.sparse_trie_max_hot_accounts(),
             disable_sparse_trie_cache_pruning: config.disable_sparse_trie_cache_pruning(),
@@ -166,11 +166,11 @@ where
     Evm: ConfigureEvm,
 {
     fn wait_for_caches(&self) -> CacheWaitDurations {
-        debug!(target: "engine::tree::payload_processor", "Waiting for execution cache and sparse trie locks");
+        debug!(target: "engine::tree::payload_processor", "Waiting for execution cache and state-root asset locks");
 
         // Wait for both caches in parallel using std threads
         let execution_cache = self.execution_cache.clone();
-        let sparse_trie = self.sparse_state_trie.clone();
+        let state_root_assets = self.state_root_assets.clone();
 
         // Use channels and spawn_blocking instead of std::thread::spawn
         let (execution_tx, execution_rx) = std::sync::mpsc::channel();
@@ -179,8 +179,8 @@ where
         self.executor.spawn_blocking_named("wait-exec-cache", move || {
             let _ = execution_tx.send(execution_cache.wait_for_availability());
         });
-        self.executor.spawn_blocking_named("wait-sparse-tri", move || {
-            let _ = sparse_trie_tx.send(sparse_trie.wait_for_availability());
+        self.executor.spawn_blocking_named("wait-state-root-assets", move || {
+            let _ = sparse_trie_tx.send(state_root_assets.wait_for_availability());
         });
 
         let execution_cache_duration =
@@ -192,7 +192,7 @@ where
             target: "engine::tree::payload_processor",
             ?execution_cache_duration,
             ?sparse_trie_duration,
-            "Execution cache and sparse trie locks acquired"
+            "Execution cache and state-root asset locks acquired"
         );
         CacheWaitDurations {
             execution_cache: execution_cache_duration,
@@ -344,18 +344,46 @@ where
     {
         let (updates_tx, from_multi_proof) = crossbeam_channel::unbounded();
 
+        let start = Instant::now();
+        let preserved = self.state_root_assets.take();
+        self.trie_metrics
+            .sparse_trie_cache_wait_duration_histogram
+            .record(start.elapsed().as_secs_f64());
+
+        let (sparse_state_trie, storage_root_cache) =
+            preserved.map(|assets| assets.into_parts_for(parent_state_root)).unwrap_or_else(|| {
+                debug!(
+                    target: "engine::tree::payload_processor",
+                    "Creating new state-root assets - no preserved assets available"
+                );
+                let default_trie = RevealableSparseTrie::blind_from(ConfigurableSparseTrie::Arena(
+                    ArenaParallelSparseTrie::default(),
+                ));
+                let trie = SparseStateTrie::default()
+                    .with_accounts_trie(default_trie.clone())
+                    .with_default_storage_trie(default_trie)
+                    .with_updates(true);
+                (trie, StorageRootCache::default())
+            });
+
         let task_ctx = ProofTaskCtx::new(multiproof_provider_factory);
         #[cfg(feature = "trie-debug")]
         let task_ctx = task_ctx.with_proof_jitter(config.proof_jitter());
-        let proof_handle = ProofWorkerHandle::new(&self.executor, task_ctx, halve_workers);
+        let proof_handle = ProofWorkerHandle::new(
+            &self.executor,
+            task_ctx,
+            halve_workers,
+            storage_root_cache.clone(),
+        );
 
         let (state_root_tx, state_root_rx) = channel();
 
         self.spawn_sparse_trie_task(
             proof_handle,
+            storage_root_cache,
+            sparse_state_trie,
             state_root_tx,
             from_multi_proof,
-            parent_state_root,
             config.multiproof_chunk_size(),
         );
 
@@ -546,12 +574,13 @@ where
     fn spawn_sparse_trie_task(
         &self,
         proof_worker_handle: ProofWorkerHandle,
+        storage_root_cache: StorageRootCache,
+        sparse_state_trie: SparseStateTrie<ConfigurableSparseTrie, ConfigurableSparseTrie>,
         state_root_tx: mpsc::Sender<Result<StateRootComputeOutcome, ParallelStateRootError>>,
         from_multi_proof: CrossbeamReceiver<StateRootMessage>,
-        parent_state_root: B256,
         chunk_size: usize,
     ) {
-        let preserved_sparse_trie = self.sparse_state_trie.clone();
+        let state_root_assets = self.state_root_assets.clone();
         let trie_metrics = self.trie_metrics.clone();
         let max_hot_slots = self.sparse_trie_max_hot_slots;
         let max_hot_accounts = self.sparse_trie_max_hot_accounts;
@@ -565,37 +594,14 @@ where
             let _enter = debug_span!(target: "engine::tree::payload_processor", parent: parent_span, "sparse_trie_task")
                 .entered();
 
-            // Reuse a stored SparseStateTrie if available, applying continuation logic.
-            // If this payload's parent state root matches the preserved trie's anchor,
-            // we can reuse the pruned trie structure. Otherwise, we clear the trie but
-            // keep allocations.
-            let start = Instant::now();
-            let preserved = preserved_sparse_trie.take();
-            trie_metrics
-                .sparse_trie_cache_wait_duration_histogram
-                .record(start.elapsed().as_secs_f64());
-
-            let mut sparse_state_trie = preserved
-                .map(|preserved| preserved.into_trie_for(parent_state_root))
-                .unwrap_or_else(|| {
-                    debug!(
-                        target: "engine::tree::payload_processor",
-                        "Creating new sparse trie - no preserved trie available"
-                    );
-                    let default_trie = RevealableSparseTrie::blind_from(
-                        ConfigurableSparseTrie::Arena(ArenaParallelSparseTrie::default()),
-                    );
-                    SparseStateTrie::default()
-                        .with_accounts_trie(default_trie.clone())
-                        .with_default_storage_trie(default_trie)
-                        .with_updates(true)
-                });
+            let mut sparse_state_trie = sparse_state_trie;
             sparse_state_trie.set_hot_cache_capacities(max_hot_slots, max_hot_accounts);
 
             let mut task = SparseTrieCacheTask::new_with_trie(
                 &executor,
                 from_multi_proof,
                 proof_worker_handle,
+                storage_root_cache.clone(),
                 trie_metrics.clone(),
                 sparse_state_trie,
                 chunk_size,
@@ -608,7 +614,7 @@ where
             // causing take() to return None and forcing it to create a new empty trie
             // instead of reusing the preserved one. Holding the guard ensures the next
             // block's take() blocks until we've stored the trie for reuse.
-            let mut guard = preserved_sparse_trie.lock();
+            let mut guard = state_root_assets.lock();
 
             let task_result = result.as_ref().ok().cloned();
             // Send state root computation result - next block may start but will block on take()
@@ -617,13 +623,14 @@ where
                 // Clear the trie instead of preserving potentially invalid state.
                 debug!(
                     target: "engine::tree::payload_processor",
-                    "State root receiver dropped, clearing trie"
+                    "State root receiver dropped, clearing state-root assets"
                 );
+                storage_root_cache.clear();
                 let (trie, deferred) = task.into_cleared_trie(
                     SPARSE_TRIE_MAX_NODES_SHRINK_CAPACITY,
                     SPARSE_TRIE_MAX_VALUES_SHRINK_CAPACITY,
                 );
-                guard.store(PreservedSparseTrie::cleared(trie));
+                guard.store(PreservedStateRootAssets::cleared(trie, storage_root_cache));
                 drop(guard);
                 executor.spawn_drop(deferred);
                 return;
@@ -652,18 +659,23 @@ where
                 trie_metrics
                     .sparse_trie_retained_storage_tries
                     .set(trie.retained_storage_tries_count() as f64);
-                guard.store(PreservedSparseTrie::anchored(trie, result.state_root));
+                guard.store(PreservedStateRootAssets::anchored(
+                    trie,
+                    storage_root_cache,
+                    result.state_root,
+                ));
                 deferred
             } else {
                 debug!(
                     target: "engine::tree::payload_processor",
-                    "State root computation failed, clearing trie"
+                    "State root computation failed, clearing state-root assets"
                 );
+                storage_root_cache.clear();
                 let (trie, deferred) = task.into_cleared_trie(
                     SPARSE_TRIE_MAX_NODES_SHRINK_CAPACITY,
                     SPARSE_TRIE_MAX_VALUES_SHRINK_CAPACITY,
                 );
-                guard.store(PreservedSparseTrie::cleared(trie));
+                guard.store(PreservedStateRootAssets::cleared(trie, storage_root_cache));
                 deferred
             };
             drop(guard);
@@ -947,6 +959,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::preserved_sparse_trie::PreservedStateRootAssets;
     use crate::tree::{
         payload_processor::{evm_state_to_hashed_post_state, ExecutionEnv, PayloadProcessor},
         precompile_cache::PrecompileCacheMap,
@@ -955,6 +968,7 @@ mod tests {
     };
     use alloy_eips::eip1898::{BlockNumHash, BlockWithParent};
     use alloy_evm::block::StateChangeSource;
+    use alloy_primitives::keccak256;
     use rand::Rng;
     use reth_chainspec::ChainSpec;
     use reth_db_common::init::init_genesis;
@@ -969,7 +983,10 @@ mod tests {
     };
     use reth_revm::db::BundleState;
     use reth_testing_utils::generators;
-    use reth_trie::{test_utils::state_root, HashedPostState};
+    use reth_trie::{
+        test_utils::{state_root, storage_root_prehashed},
+        HashedPostState,
+    };
     use reth_trie_db::ChangesetCache;
     use revm_primitives::{Address, HashMap, B256, KECCAK_EMPTY, U256};
     use revm_state::{AccountInfo, AccountStatus, EvmState, EvmStorageSlot};
@@ -1257,6 +1274,101 @@ mod tests {
             root_from_task, root_from_regular,
             "State root mismatch: task={root_from_task}, base={root_from_regular}"
         );
+    }
+
+    #[test]
+    fn state_root_assets_publish_final_storage_roots() {
+        reth_tracing::init_test_tracing();
+
+        let factory = create_test_provider_factory_with_chain_spec(Arc::new(ChainSpec::default()));
+        let genesis_hash = init_genesis(&factory).unwrap();
+
+        let address = Address::from([0x11; 20]);
+        let slot = U256::from(42);
+        let value = U256::from(999);
+        let hashed_address = keccak256(address);
+        let hashed_slot = keccak256(B256::from(slot.to_be_bytes::<32>()));
+        let expected_storage_root = storage_root_prehashed([(hashed_slot, value)]);
+
+        let update = EvmState::from_iter([(
+            address,
+            revm_state::Account {
+                info: AccountInfo {
+                    balance: U256::from(100),
+                    nonce: 1,
+                    code_hash: KECCAK_EMPTY,
+                    code: Some(Default::default()),
+                    account_id: None,
+                },
+                original_info: Box::new(AccountInfo::default()),
+                storage: HashMap::from_iter([(
+                    slot,
+                    EvmStorageSlot::new_changed(U256::ZERO, value, 0),
+                )]),
+                status: AccountStatus::Touched,
+                transaction_id: 0,
+            },
+        )]);
+
+        {
+            let provider_rw = factory.provider_rw().expect("failed to get provider");
+            provider_rw
+                .insert_account_for_hashing([(
+                    address,
+                    Some(Account::from_revm_account(update.get(&address).unwrap())),
+                )])
+                .expect("failed to insert account");
+            provider_rw
+                .insert_storage_for_hashing([(
+                    address,
+                    [StorageEntry { key: B256::from(slot), value }],
+                )])
+                .expect("failed to insert storage");
+            provider_rw.commit().expect("failed to commit changes");
+        }
+
+        let mut payload_processor = PayloadProcessor::new(
+            reth_tasks::Runtime::test(),
+            EthEvmConfig::new(factory.chain_spec()),
+            &TreeConfig::default(),
+            PrecompileCacheMap::default(),
+        );
+
+        let provider_factory = BlockchainProvider::new(factory).unwrap();
+        let mut handle = payload_processor.spawn(
+            ExecutionEnv::test_default(),
+            (
+                Vec::<Result<Recovered<TransactionSigned>, core::convert::Infallible>>::new(),
+                std::convert::identity,
+            ),
+            StateProviderBuilder::new(provider_factory.clone(), genesis_hash, None),
+            OverlayStateProviderFactory::new(provider_factory, ChangesetCache::new()),
+            &TreeConfig::default(),
+            None,
+        );
+
+        let mut state_hook = handle.state_hook().expect("state hook is None");
+        state_hook.on_state(StateChangeSource::Transaction(0), &update);
+        drop(state_hook);
+
+        let outcome = handle.state_root().expect("task failed");
+        let preserved = payload_processor
+            .state_root_assets
+            .take()
+            .expect("expected preserved state-root assets");
+
+        match preserved {
+            PreservedStateRootAssets::Anchored { storage_root_cache, state_root, .. } => {
+                assert_eq!(state_root, outcome.state_root);
+                assert_eq!(
+                    storage_root_cache.get(&hashed_address).as_deref().copied(),
+                    Some(expected_storage_root),
+                );
+            }
+            PreservedStateRootAssets::Cleared { .. } => {
+                panic!("expected anchored state-root assets")
+            }
+        }
     }
 
     /// Tests the full prewarm lifecycle for a fork block:

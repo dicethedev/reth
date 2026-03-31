@@ -175,6 +175,7 @@ impl ProofWorkerHandle {
         runtime: &Runtime,
         task_ctx: ProofTaskCtx<Factory>,
         halve_workers: bool,
+        cached_storage_roots: Arc<DashMap<B256, B256>>,
     ) -> Self
     where
         Factory: DatabaseProviderROFactory<Provider: TrieCursorFactory + HashedCursorFactory>
@@ -185,8 +186,6 @@ impl ProofWorkerHandle {
     {
         let (storage_work_tx, storage_work_rx) = unbounded::<StorageWorkerJob>();
         let (account_work_tx, account_work_rx) = unbounded::<AccountWorkerJob>();
-
-        let cached_storage_roots = Arc::<DashMap<_, _>>::default();
 
         let divisor = if halve_workers { 2 } else { 1 };
         let storage_worker_count =
@@ -1405,7 +1404,8 @@ mod tests {
         let ctx = test_ctx(factory);
 
         let runtime = reth_tasks::Runtime::test();
-        let proof_handle = ProofWorkerHandle::new(&runtime, ctx, false);
+        let proof_handle =
+            ProofWorkerHandle::new(&runtime, ctx, false, Arc::<DashMap<_, _>>::default());
 
         // Verify handle can be cloned
         let _cloned_handle = proof_handle.clone();
