@@ -2612,7 +2612,12 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
 
 impl<N: NodePrimitives> StaticFileProvider<N> {
     fn changeset_count_for_segment(&self, segment: StaticFileSegment) -> ProviderResult<usize> {
-        let Some(block_ranges) = self.expected_block_index(segment) else {
+        let Some(block_ranges) = self
+            .indexes
+            .read()
+            .get(segment)
+            .map(|index| index.expected_block_ranges_by_max_block.clone())
+        else {
             return Ok(0);
         };
 
