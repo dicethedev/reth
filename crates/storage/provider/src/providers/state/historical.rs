@@ -1,6 +1,7 @@
 use crate::{
-    AccountReader, BlockHashReader, ChangeSetReader, EitherReader, HashedPostStateProvider,
-    ProviderError, RocksDBProviderFactory, StateProvider, StateRootProvider,
+    providers::RocksReadSnapshot, AccountReader, BlockHashReader, ChangeSetReader, EitherReader,
+    HashedPostStateProvider, ProviderError, RocksDBProviderFactory, StateProvider,
+    StateRootProvider,
 };
 use alloy_eips::merge::EPOCH_SLOTS;
 use alloy_primitives::{Address, BlockNumber, Bytes, StorageKey, StorageValue, B256};
@@ -32,8 +33,7 @@ use reth_trie_db::{
     DatabaseStorageProof, DatabaseStorageRoot,
 };
 
-use crate::providers::rocksdb::OwnedRocksReadSnapshot;
-use std::{fmt::Debug, sync::Arc};
+use std::fmt::Debug;
 
 type DbStateRoot<'a, TX, A> = StateRoot<
     reth_trie_db::DatabaseTrieCursorFactory<&'a TX, A>,
@@ -128,8 +128,8 @@ pub struct HistoricalStateProviderRef<'b, Provider> {
     block_number: BlockNumber,
     /// Lowest blocks at which different parts of the state are available.
     lowest_available_blocks: LowestAvailableBlocks,
-    /// Pinned RocksDB snapshot for cross-store read consistency.
-    pub(crate) pinned_rocksdb_snapshot: Option<&'b Arc<OwnedRocksReadSnapshot>>,
+    /// Pinned RocksDB snapshot taken alongside the MDBX read transaction.
+    pinned_rocksdb_snapshot: Option<&'b RocksReadSnapshot>,
 }
 
 impl<'b, Provider: DBProvider + ChangeSetReader + StorageChangeSetReader + BlockNumReader>
@@ -155,6 +155,11 @@ impl<'b, Provider: DBProvider + ChangeSetReader + StorageChangeSetReader + Block
         Self { provider, block_number, lowest_available_blocks, pinned_rocksdb_snapshot: None }
     }
 
+    pub(crate) fn with_pinned_rocksdb_snapshot(mut self, snapshot: &'b RocksReadSnapshot) -> Self {
+        self.pinned_rocksdb_snapshot = Some(snapshot);
+        self
+    }
+
     /// Lookup an account in the `AccountsHistory` table using `EitherReader`.
     pub fn account_history_lookup(&self, address: Address) -> ProviderResult<HistoryInfo>
     where
@@ -164,12 +169,12 @@ impl<'b, Provider: DBProvider + ChangeSetReader + StorageChangeSetReader + Block
             return Err(ProviderError::StateAtBlockPruned(self.block_number))
         }
 
-        if let Some(snapshot) = &self.pinned_rocksdb_snapshot {
+        if let Some(snapshot) = self.pinned_rocksdb_snapshot {
             return snapshot.account_history_info(
                 address,
                 self.block_number,
                 self.lowest_available_blocks.account_history_block_number,
-            );
+            )
         }
 
         self.provider.with_rocksdb_snapshot(|rocksdb_ref| {
@@ -197,13 +202,13 @@ impl<'b, Provider: DBProvider + ChangeSetReader + StorageChangeSetReader + Block
             return Err(ProviderError::StateAtBlockPruned(self.block_number))
         }
 
-        if let Some(snapshot) = &self.pinned_rocksdb_snapshot {
+        if let Some(snapshot) = self.pinned_rocksdb_snapshot {
             return snapshot.storage_history_info(
                 address,
                 lookup_key,
                 self.block_number,
                 self.lowest_available_blocks.storage_history_block_number,
-            );
+            )
         }
 
         self.provider.with_rocksdb_snapshot(|rocksdb_ref| {
@@ -614,8 +619,8 @@ pub struct HistoricalStateProvider<Provider> {
     block_number: BlockNumber,
     /// Lowest blocks at which different parts of the state are available.
     lowest_available_blocks: LowestAvailableBlocks,
-    /// Pinned RocksDB snapshot for cross-store read consistency.
-    pinned_rocksdb_snapshot: Option<Arc<OwnedRocksReadSnapshot>>,
+    /// Pinned RocksDB snapshot taken alongside the MDBX read transaction.
+    pinned_rocksdb_snapshot: Option<RocksReadSnapshot>,
 }
 
 impl<Provider: DBProvider + ChangeSetReader + StorageChangeSetReader + BlockNumReader>
@@ -631,8 +636,7 @@ impl<Provider: DBProvider + ChangeSetReader + StorageChangeSetReader + BlockNumR
         }
     }
 
-    /// Sets the pinned RocksDB snapshot for cross-store read consistency.
-    pub fn with_pinned_rocksdb_snapshot(mut self, snapshot: Arc<OwnedRocksReadSnapshot>) -> Self {
+    pub(crate) fn with_pinned_rocksdb_snapshot(mut self, snapshot: RocksReadSnapshot) -> Self {
         self.pinned_rocksdb_snapshot = Some(snapshot);
         self
     }
@@ -658,11 +662,16 @@ impl<Provider: DBProvider + ChangeSetReader + StorageChangeSetReader + BlockNumR
     /// Returns a new provider that takes the `TX` as reference
     #[inline(always)]
     fn as_ref(&self) -> HistoricalStateProviderRef<'_, Provider> {
-        HistoricalStateProviderRef {
-            provider: &self.provider,
-            block_number: self.block_number,
-            lowest_available_blocks: self.lowest_available_blocks,
-            pinned_rocksdb_snapshot: self.pinned_rocksdb_snapshot.as_ref(),
+        let provider = HistoricalStateProviderRef::new_with_lowest_available_blocks(
+            &self.provider,
+            self.block_number,
+            self.lowest_available_blocks,
+        );
+
+        if let Some(snapshot) = self.pinned_rocksdb_snapshot.as_ref() {
+            provider.with_pinned_rocksdb_snapshot(snapshot)
+        } else {
+            provider
         }
     }
 }

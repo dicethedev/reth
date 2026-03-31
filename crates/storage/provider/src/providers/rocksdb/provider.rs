@@ -704,8 +704,17 @@ impl RocksDBProvider {
     /// Returns a read-only, point-in-time snapshot of the database.
     ///
     /// Lighter weight than [`RocksTx`] — no write-conflict tracking, and `Send + Sync`.
-    pub fn snapshot(&self) -> RocksReadSnapshot<'_> {
-        RocksReadSnapshot { inner: self.0.snapshot(), provider: self }
+    pub fn snapshot(&self) -> RocksReadSnapshot {
+        // SAFETY: the snapshot borrows the underlying RocksDB handle stored inside the provider's
+        // `Arc`. Cloning the provider keeps that allocation alive for the lifetime of the snapshot,
+        // and `RocksReadSnapshot` drops `inner` before `provider`.
+        let inner = unsafe {
+            std::mem::transmute::<RocksReadSnapshotInner<'_>, RocksReadSnapshotInner<'static>>(
+                self.0.snapshot(),
+            )
+        };
+
+        RocksReadSnapshot { inner, provider: self.clone() }
     }
 
     /// Creates a new transaction with MDBX-like semantics (read-your-writes, rollback).
@@ -1378,9 +1387,11 @@ impl RocksDBProvider {
 /// used by [`EitherReader::RocksDB`](crate::either_writer::EitherReader) for history lookups.
 ///
 /// Lighter weight than [`RocksTx`] — no transaction overhead, no write support.
-pub struct RocksReadSnapshot<'db> {
-    inner: RocksReadSnapshotInner<'db>,
-    provider: &'db RocksDBProvider,
+pub struct RocksReadSnapshot {
+    // `inner` must drop before `provider` so the borrowed RocksDB snapshot is released before the
+    // cloned provider keeping the DB alive goes away.
+    inner: RocksReadSnapshotInner<'static>,
+    provider: RocksDBProvider,
 }
 
 /// Inner enum to hold the snapshot for either read-write or read-only mode.
@@ -1401,7 +1412,7 @@ impl<'db> RocksReadSnapshotInner<'db> {
     }
 }
 
-impl fmt::Debug for RocksReadSnapshot<'_> {
+impl fmt::Debug for RocksReadSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RocksReadSnapshot")
             .field("provider", &self.provider)
@@ -1409,9 +1420,9 @@ impl fmt::Debug for RocksReadSnapshot<'_> {
     }
 }
 
-impl<'db> RocksReadSnapshot<'db> {
+impl RocksReadSnapshot {
     /// Gets the column family handle for a table.
-    fn cf_handle<T: Table>(&self) -> Result<&'db rocksdb::ColumnFamily, DatabaseError> {
+    fn cf_handle<T: Table>(&self) -> Result<&rocksdb::ColumnFamily, DatabaseError> {
         self.provider.get_cf_handle::<T>()
     }
 
@@ -1431,178 +1442,6 @@ impl<'db> RocksReadSnapshot<'db> {
         })?;
 
         Ok(result.and_then(|value| T::Value::decompress(&value).ok()))
-    }
-
-    /// Lookup account history and return [`HistoryInfo`] directly.
-    pub fn account_history_info(
-        &self,
-        address: Address,
-        block_number: BlockNumber,
-        lowest_available_block_number: Option<BlockNumber>,
-    ) -> ProviderResult<HistoryInfo> {
-        let key = ShardedKey::new(address, block_number);
-        self.history_info::<tables::AccountsHistory>(
-            key.encode().as_ref(),
-            block_number,
-            lowest_available_block_number,
-            |key_bytes| Ok(<ShardedKey<Address> as Decode>::decode(key_bytes)?.key == address),
-            |prev_bytes| {
-                <ShardedKey<Address> as Decode>::decode(prev_bytes)
-                    .map(|k| k.key == address)
-                    .unwrap_or(false)
-            },
-        )
-    }
-
-    /// Lookup storage history and return [`HistoryInfo`] directly.
-    pub fn storage_history_info(
-        &self,
-        address: Address,
-        storage_key: B256,
-        block_number: BlockNumber,
-        lowest_available_block_number: Option<BlockNumber>,
-    ) -> ProviderResult<HistoryInfo> {
-        let key = StorageShardedKey::new(address, storage_key, block_number);
-        self.history_info::<tables::StoragesHistory>(
-            key.encode().as_ref(),
-            block_number,
-            lowest_available_block_number,
-            |key_bytes| {
-                let k = <StorageShardedKey as Decode>::decode(key_bytes)?;
-                Ok(k.address == address && k.sharded_key.key == storage_key)
-            },
-            |prev_bytes| {
-                <StorageShardedKey as Decode>::decode(prev_bytes)
-                    .map(|k| k.address == address && k.sharded_key.key == storage_key)
-                    .unwrap_or(false)
-            },
-        )
-    }
-
-    /// Generic history lookup using the snapshot's raw iterator.
-    fn history_info<T>(
-        &self,
-        encoded_key: &[u8],
-        block_number: BlockNumber,
-        lowest_available_block_number: Option<BlockNumber>,
-        key_matches: impl FnOnce(&[u8]) -> Result<bool, reth_db_api::DatabaseError>,
-        prev_key_matches: impl Fn(&[u8]) -> bool,
-    ) -> ProviderResult<HistoryInfo>
-    where
-        T: Table<Value = BlockNumberList>,
-    {
-        let is_maybe_pruned = lowest_available_block_number.is_some();
-        let fallback = || {
-            Ok(if is_maybe_pruned {
-                HistoryInfo::MaybeInPlainState
-            } else {
-                HistoryInfo::NotYetWritten
-            })
-        };
-
-        let cf = self.cf_handle::<T>()?;
-        let mut iter = self.inner.raw_iterator_cf(cf);
-
-        iter.seek(encoded_key);
-        iter.status().map_err(|e| {
-            ProviderError::Database(DatabaseError::Read(DatabaseErrorInfo {
-                message: e.to_string().into(),
-                code: -1,
-            }))
-        })?;
-
-        if !iter.valid() {
-            return fallback();
-        }
-
-        let Some(key_bytes) = iter.key() else {
-            return fallback();
-        };
-        if !key_matches(key_bytes)? {
-            return fallback();
-        }
-
-        let Some(value_bytes) = iter.value() else {
-            return fallback();
-        };
-        let chunk = BlockNumberList::decompress(value_bytes)?;
-        let (rank, found_block) = compute_history_rank(&chunk, block_number);
-
-        let is_before_first_write = if needs_prev_shard_check(rank, found_block, block_number) {
-            iter.prev();
-            iter.status().map_err(|e| {
-                ProviderError::Database(DatabaseError::Read(DatabaseErrorInfo {
-                    message: e.to_string().into(),
-                    code: -1,
-                }))
-            })?;
-            let has_prev = iter.valid() && iter.key().is_some_and(&prev_key_matches);
-            !has_prev
-        } else {
-            false
-        };
-
-        Ok(HistoryInfo::from_lookup(
-            found_block,
-            is_before_first_write,
-            lowest_available_block_number,
-        ))
-    }
-}
-
-/// An owned RocksDB read snapshot that keeps the provider alive.
-///
-/// This allows pinning a RocksDB snapshot at creation time and reusing it
-/// for all subsequent reads, ensuring consistency with an MDBX read transaction
-/// opened at the same point in time.
-///
-/// # Safety
-///
-/// `RocksDBProvider` wraps `Arc<RocksDBProviderInner>`, so the inner DB is
-/// heap-allocated and stable. The snapshot borrows from the DB, which won't
-/// move or be dropped while the Arc is held. Rust drops fields in declaration
-/// order, so `inner` (the snapshot) is dropped before `_provider` (the Arc).
-pub struct OwnedRocksReadSnapshot {
-    // IMPORTANT: `inner` must be declared before `_provider` so it drops first.
-    inner: RocksReadSnapshotInner<'static>,
-    _provider: RocksDBProvider,
-}
-
-impl fmt::Debug for OwnedRocksReadSnapshot {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OwnedRocksReadSnapshot").finish_non_exhaustive()
-    }
-}
-
-// SAFETY: RocksDB snapshots are thread-safe — the underlying C++ SnapshotImpl is
-// reference-counted and immutable. RocksDBProvider is Arc-based and already Send+Sync.
-unsafe impl Send for OwnedRocksReadSnapshot {}
-unsafe impl Sync for OwnedRocksReadSnapshot {}
-
-impl RocksDBProvider {
-    /// Creates an owned, pinned read snapshot.
-    ///
-    /// The returned snapshot keeps the provider alive and can be stored alongside
-    /// an MDBX read transaction to ensure cross-store consistency.
-    pub fn owned_snapshot(&self) -> OwnedRocksReadSnapshot {
-        // SAFETY: The snapshot borrows from the DB inside Arc<RocksDBProviderInner>.
-        // We clone the Arc (cheap) to keep it alive. The snapshot's actual lifetime
-        // is tied to the Arc, which we guarantee by storing both in the struct
-        // (with snapshot dropped first due to field order).
-        let snapshot = self.0.snapshot();
-        let inner = unsafe {
-            std::mem::transmute::<RocksReadSnapshotInner<'_>, RocksReadSnapshotInner<'static>>(
-                snapshot,
-            )
-        };
-        OwnedRocksReadSnapshot { inner, _provider: self.clone() }
-    }
-}
-
-impl OwnedRocksReadSnapshot {
-    /// Gets the column family handle for a table.
-    fn cf_handle<T: Table>(&self) -> Result<&rocksdb::ColumnFamily, DatabaseError> {
-        self._provider.get_cf_handle::<T>()
     }
 
     /// Lookup account history and return [`HistoryInfo`] directly.
@@ -3206,6 +3045,33 @@ mod tests {
 
         let result = ro_provider.snapshot().account_history_info(address, 400, None).unwrap();
         assert_eq!(result, HistoryInfo::InPlainState);
+    }
+
+    #[test]
+    fn test_snapshot_stays_pinned_after_later_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let provider = RocksDBBuilder::new(temp_dir.path()).with_default_tables().build().unwrap();
+
+        let address = Address::from([0x42; 20]);
+
+        let mut batch = provider.batch();
+        batch.append_account_history_shard(address, vec![100]).unwrap();
+        batch.commit().unwrap();
+
+        let pinned_snapshot = provider.snapshot();
+
+        let mut batch = provider.batch();
+        batch.append_account_history_shard(address, vec![200]).unwrap();
+        batch.commit().unwrap();
+
+        assert_eq!(
+            pinned_snapshot.account_history_info(address, 150, None).unwrap(),
+            HistoryInfo::InPlainState
+        );
+        assert_eq!(
+            provider.snapshot().account_history_info(address, 150, None).unwrap(),
+            HistoryInfo::InChangeset(200)
+        );
     }
 
     #[test]

@@ -2,9 +2,7 @@ use crate::{
     changesets_utils::StorageRevertsIter,
     providers::{
         database::{chain::ChainStorage, metrics},
-        rocksdb::{
-            OwnedRocksReadSnapshot, PendingRocksDBBatches, RocksDBProvider, RocksDBWriteCtx,
-        },
+        rocksdb::{PendingRocksDBBatches, RocksDBProvider, RocksDBWriteCtx, RocksReadSnapshot},
         static_file::{StaticFileWriteCtx, StaticFileWriter},
         NodeTypesForProvider, StaticFileProvider,
     },
@@ -214,10 +212,8 @@ pub struct DatabaseProvider<TX, N: NodeTypes> {
     minimum_pruning_distance: u64,
     /// Database provider metrics
     metrics: metrics::DatabaseProviderMetrics,
-    /// Pinned RocksDB snapshot for cross-store read consistency.
-    /// When set, `HistoricalStateProvider` uses this instead of creating per-query snapshots.
-    /// This ensures the RocksDB view is consistent with the MDBX read transaction.
-    pinned_rocksdb_snapshot: Option<Arc<OwnedRocksReadSnapshot>>,
+    /// Pinned RocksDB snapshot taken alongside the MDBX read transaction.
+    pinned_rocksdb_snapshot: Option<RocksReadSnapshot>,
 }
 
 impl<TX: Debug, N: NodeTypes> Debug for DatabaseProvider<TX, N> {
@@ -252,15 +248,17 @@ impl<TX, N: NodeTypes> DatabaseProvider<TX, N> {
         self
     }
 
-    /// Sets the pinned RocksDB snapshot for cross-store read consistency.
-    pub fn with_pinned_rocksdb_snapshot(mut self, snapshot: Arc<OwnedRocksReadSnapshot>) -> Self {
+    pub(crate) fn with_pinned_rocksdb_snapshot(mut self, snapshot: RocksReadSnapshot) -> Self {
         self.pinned_rocksdb_snapshot = Some(snapshot);
         self
     }
 
-    /// Returns the pinned RocksDB snapshot, if set.
-    pub fn pinned_rocksdb_snapshot(&self) -> Option<&Arc<OwnedRocksReadSnapshot>> {
+    pub(crate) fn pinned_rocksdb_snapshot(&self) -> Option<&RocksReadSnapshot> {
         self.pinned_rocksdb_snapshot.as_ref()
+    }
+
+    fn take_pinned_rocksdb_snapshot(&mut self) -> Option<RocksReadSnapshot> {
+        self.pinned_rocksdb_snapshot.take()
     }
 }
 
@@ -293,9 +291,8 @@ impl<TX: DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
             self.get_prune_checkpoint(PruneSegment::StorageHistory)?;
 
         let mut state_provider = HistoricalStateProviderRef::new(self, block_number);
-
-        if let Some(snapshot) = &self.pinned_rocksdb_snapshot {
-            state_provider.pinned_rocksdb_snapshot = Some(snapshot);
+        if let Some(snapshot) = self.pinned_rocksdb_snapshot() {
+            state_provider = state_provider.with_pinned_rocksdb_snapshot(snapshot);
         }
 
         // If we pruned account or storage history, we can't return state on every historical block.
@@ -891,7 +888,8 @@ impl<TX: DbTx + 'static, N: NodeTypes> TryIntoHistoricalStateProvider for Databa
         self,
         mut block_number: BlockNumber,
     ) -> ProviderResult<StateProviderBox> {
-        let best_block = self.best_block_number().unwrap_or_default();
+        let mut provider = self;
+        let best_block = provider.best_block_number().unwrap_or_default();
 
         // Reject requests for blocks beyond the best block
         if block_number > best_block {
@@ -903,21 +901,21 @@ impl<TX: DbTx + 'static, N: NodeTypes> TryIntoHistoricalStateProvider for Databa
 
         // If requesting state at the best block, use the latest state provider
         if block_number == best_block {
-            return Ok(Box::new(LatestStateProvider::new(self)));
+            return Ok(Box::new(LatestStateProvider::new(provider)));
         }
 
         // +1 as the changeset that we want is the one that was applied after this block.
         block_number += 1;
 
         let account_history_prune_checkpoint =
-            self.get_prune_checkpoint(PruneSegment::AccountHistory)?;
+            provider.get_prune_checkpoint(PruneSegment::AccountHistory)?;
         let storage_history_prune_checkpoint =
-            self.get_prune_checkpoint(PruneSegment::StorageHistory)?;
-        let pinned_snapshot = self.pinned_rocksdb_snapshot.clone();
+            provider.get_prune_checkpoint(PruneSegment::StorageHistory)?;
 
-        let mut state_provider = HistoricalStateProvider::new(self, block_number);
+        let pinned_rocksdb_snapshot = provider.take_pinned_rocksdb_snapshot();
 
-        if let Some(snapshot) = pinned_snapshot {
+        let mut state_provider = HistoricalStateProvider::new(provider, block_number);
+        if let Some(snapshot) = pinned_rocksdb_snapshot {
             state_provider = state_provider.with_pinned_rocksdb_snapshot(snapshot);
         }
 
