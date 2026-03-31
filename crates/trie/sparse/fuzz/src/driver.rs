@@ -1,6 +1,6 @@
-use alloy_primitives::map::B256Map;
+use alloy_primitives::{B256, map::B256Map};
 use rand::{SeedableRng, rngs::StdRng};
-use reth_trie::test_utils::TrieTestHarness;
+use reth_trie::{EMPTY_ROOT_HASH, test_utils::TrieTestHarness};
 use reth_trie_common::{Nibbles, ProofV2Target};
 use reth_trie_sparse::{
     ArenaParallelSparseTrie, ArenaParallelismThresholds, LeafUpdate, ParallelSparseTrie,
@@ -19,6 +19,12 @@ const MAX_RETRY_ITERS: usize = 64;
 /// Per-round operation count bounds.
 const MIN_ROUND_OPS: usize = 3;
 const MAX_ROUND_OPS: usize = 10;
+
+#[derive(Debug, Clone, Copy)]
+enum TrieResetKind {
+    Clear,
+    Wipe,
+}
 
 /// Fuzzer entry point for the arena-backed sparse trie.
 pub fn run_arena(input: FuzzInput) {
@@ -47,11 +53,8 @@ where
         return;
     }
 
-    // 1. Build large initial state.
+    // 1. Build initial state.
     let initial_storage = build_initial_storage(&input.initial);
-    if initial_storage.is_empty() {
-        return;
-    }
 
     let mut live_state = initial_storage.clone();
     let mut harness = TrieTestHarness::new(initial_storage);
@@ -60,7 +63,7 @@ where
     let root_node = harness.root_node();
     let mut trie = make_trie(input.profile);
 
-    trie.set_root(root_node.node, root_node.masks, false)
+    trie.set_root(root_node.node, root_node.masks, true)
         .unwrap_or_else(|err| panic!("{trie_label} set_root should succeed: {err}"));
 
     let mut pools = KeyPools::from_storage(&live_state);
@@ -136,6 +139,32 @@ where
                     checkpoint_root(&mut trie, &harness, round_idx, Some(op_idx), trie_label);
                     roots_fresh_since_last_apply = true;
                 }
+                RoundOp::ClearAndReload => {
+                    reset_trie_to_current_state(
+                        &mut trie,
+                        &harness,
+                        round_idx,
+                        op_idx,
+                        trie_label,
+                        TrieResetKind::Clear,
+                    );
+                    pools.observe_reset();
+                    pruned_this_round = true;
+                    roots_fresh_since_last_apply = true;
+                }
+                RoundOp::WipeAndReload => {
+                    reset_trie_to_current_state(
+                        &mut trie,
+                        &harness,
+                        round_idx,
+                        op_idx,
+                        trie_label,
+                        TrieResetKind::Wipe,
+                    );
+                    pools.observe_reset();
+                    pruned_this_round = true;
+                    roots_fresh_since_last_apply = true;
+                }
             }
         }
 
@@ -159,7 +188,8 @@ where
 
         // Always checkpoint at end of round to keep strong invariants regardless of op schedule.
         if updates_applied {
-            checkpoint_root(&mut trie, &harness, round_idx, None, trie_label);
+            let expected_root = checkpoint_root(&mut trie, &harness, round_idx, None, trie_label);
+            commit_tracked_updates(&mut trie, expected_root, round_idx, trie_label);
         }
 
         if !pruned_this_round {
@@ -175,6 +205,8 @@ fn materialize_round_ops(spec: &BlockSpec) -> Vec<RoundOp> {
             RoundOp::CheckpointRoot,
             RoundOp::Prune,
             RoundOp::CheckpointRoot,
+            RoundOp::ClearAndReload,
+            RoundOp::WipeAndReload,
         ];
     }
 
@@ -218,7 +250,7 @@ fn checkpoint_root<T: SparseTrie>(
     round_idx: usize,
     op_idx: Option<usize>,
     trie_label: &str,
-) {
+) -> B256 {
     let trie_root = trie.root();
     let expected_root = harness.original_root();
 
@@ -226,6 +258,71 @@ fn checkpoint_root<T: SparseTrie>(
     assert_eq!(
         trie_root, expected_root,
         "oracle mismatch at round {round_idx} ({phase}): {trie_label}={trie_root} expected={expected_root}"
+    );
+
+    trie_root
+}
+
+fn commit_tracked_updates<T: SparseTrie>(
+    trie: &mut T,
+    expected_root: B256,
+    round_idx: usize,
+    trie_label: &str,
+) {
+    let updates = trie.take_updates();
+    trie.commit_updates(&updates.updated_nodes, &updates.removed_nodes);
+
+    let committed_root = trie.root();
+    assert_eq!(
+        committed_root, expected_root,
+        "root changed after commit_updates at round {round_idx}: {trie_label}={committed_root} expected={expected_root}"
+    );
+}
+
+fn reset_trie_to_current_state<T: SparseTrie>(
+    trie: &mut T,
+    harness: &TrieTestHarness,
+    round_idx: usize,
+    op_idx: usize,
+    trie_label: &str,
+    reset_kind: TrieResetKind,
+) {
+    let reset_name = match reset_kind {
+        TrieResetKind::Clear => {
+            trie.clear();
+            "clear"
+        }
+        TrieResetKind::Wipe => {
+            trie.wipe();
+            "wipe"
+        }
+    };
+
+    let empty_root = trie.root();
+    assert_eq!(
+        empty_root, EMPTY_ROOT_HASH,
+        "{trie_label} {reset_name} should produce EMPTY_ROOT_HASH at round {round_idx}, op {op_idx}"
+    );
+
+    let updates = trie.take_updates();
+    assert_eq!(
+        updates.wiped,
+        matches!(reset_kind, TrieResetKind::Wipe),
+        "{trie_label} {reset_name} update tracking mismatch at round {round_idx}, op {op_idx}"
+    );
+
+    let root_node = harness.root_node();
+    trie.set_root(root_node.node, root_node.masks, true).unwrap_or_else(|err| {
+        panic!(
+            "{trie_label} set_root should succeed after {reset_name} at round {round_idx}, op {op_idx}: {err}"
+        )
+    });
+
+    let reloaded_root = trie.root();
+    let expected_root = harness.original_root();
+    assert_eq!(
+        reloaded_root, expected_root,
+        "{trie_label} root mismatch after {reset_name}+reload at round {round_idx}, op {op_idx}: {reloaded_root} expected={expected_root}"
     );
 }
 

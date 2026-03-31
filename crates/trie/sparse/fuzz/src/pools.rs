@@ -64,6 +64,15 @@ impl KeyPools {
         self.recently_pruned.clear();
     }
 
+    /// Reset reveal-tracking after the sparse trie is cleared or wiped.
+    ///
+    /// The trie is reinitialized from just the current root, so previously hot/pruned leaves are
+    /// no longer revealed even though the keys remain part of the logical state.
+    pub fn observe_reset(&mut self) {
+        self.hot.clear();
+        self.recently_pruned.clear();
+    }
+
     /// Select keys for a block from the available pools.
     ///
     /// Returns `(keys, touched_set)` where `touched_set` includes all selected keys.

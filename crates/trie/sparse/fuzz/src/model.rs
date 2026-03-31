@@ -59,7 +59,9 @@ pub fn build_initial_storage(spec: &InitialStateSpec) -> BTreeMap<B256, U256> {
 fn normalize_initial_count(spec: &InitialStateSpec) -> usize {
     match spec.size_mode {
         InitialSizeMode::Large => 500 + (spec.key_count % 1501) as usize,
-        InitialSizeMode::Small => 8 + (spec.key_count % 57) as usize,
+        // Small states intentionally include empty and single-leaf tries so the harness can
+        // reinitialize from `EmptyRoot` and leaf roots, which are both real sparse-trie states.
+        InitialSizeMode::Small => (spec.key_count % 16) as usize,
     }
 }
 
@@ -79,8 +81,8 @@ pub fn realize_block(
     live_state: &BTreeMap<B256, U256>,
     pools: &mut KeyPools,
 ) -> RealizedBlock {
-    let touch_count = 5 + (spec.touch_count % 46) as usize;
-    let delete_pct = (spec.delete_pct % 41) as usize;
+    let touch_count = 1 + (spec.touch_count % 50) as usize;
+    let delete_pct = (spec.delete_pct % 101) as usize;
     let touched_pct = (spec.touched_pct % 21) as usize;
 
     let mut rng = StdRng::seed_from_u64(spec.key_seed);
@@ -99,15 +101,15 @@ pub fn realize_block(
     let mut changeset = BTreeMap::new();
     let mut touched_keys = BTreeSet::new();
 
-    for (i, key) in keys.into_iter().enumerate() {
+    for key in keys {
         touched_keys.insert(key);
 
-        let pct_position = (i * 100) / touch_count.max(1);
+        let roll = rng.random_range(0..100usize);
 
-        if pct_position < touched_pct {
+        if roll < touched_pct {
             // LeafUpdate::Touched — no state change.
             leaf_updates.insert(key, LeafUpdate::Touched);
-        } else if pct_position < touched_pct + delete_pct && live_state.contains_key(&key) {
+        } else if roll < touched_pct + delete_pct && live_state.contains_key(&key) {
             // Delete an existing key.
             leaf_updates.insert(key, LeafUpdate::Changed(Vec::new()));
             changeset.insert(key, U256::ZERO);

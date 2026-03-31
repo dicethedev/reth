@@ -45,7 +45,8 @@ pub struct InitialStateSpec {
 pub enum InitialSizeMode {
     /// Production-like state size.
     Large,
-    /// Small state to maximize structural churn and branch collapse activity.
+    /// Small state, including empty and single-leaf roots, to maximize lifecycle and collapse
+    /// coverage.
     Small,
 }
 
@@ -65,11 +66,11 @@ pub enum InitialLayout {
 pub struct BlockSpec {
     /// Which subtrie prefixes to concentrate work under.
     pub subtrie_mode: SubtrieMode,
-    /// Raw touch count — normalized to 5..=50.
+    /// Raw touch count — normalized to 1..=50.
     pub touch_count: u8,
     /// Raw retain count — normalized to 0..=16.
     pub retain_count: u8,
-    /// Percentage of operations that are deletes (0..=40).
+    /// Percentage of operations that are deletes (0..=100).
     pub delete_pct: u8,
     /// Percentage of operations that are LeafUpdate::Touched (0..=20).
     pub touched_pct: u8,
@@ -96,6 +97,12 @@ pub enum RoundOp {
     Prune,
     /// Compute roots and compare both impls with the oracle at this point in time.
     CheckpointRoot,
+    /// Clear the trie while preserving allocations, verify the empty root, then re-initialize it
+    /// from the current oracle state.
+    ClearAndReload,
+    /// Wipe the trie, verify the empty root and wiped updates, then re-initialize it from the
+    /// current oracle state.
+    WipeAndReload,
 }
 
 /// Controls how keys are distributed across subtries within a block.
