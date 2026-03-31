@@ -234,10 +234,13 @@ impl ChangesetOffsetReader {
             return Ok(0);
         }
 
-        match self.get(self.len - 1)? {
-            Some(last) => Ok(last.offset() + last.num_changes()),
-            None => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing last csoff record")),
-        }
+        let last = self.get(self.len - 1)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "missing last csoff record")
+        })?;
+
+        last.offset().checked_add(last.num_changes()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "csoff total_changes overflow")
+        })
     }
 }
 
@@ -455,6 +458,38 @@ mod tests {
 
         let mut reader = ChangesetOffsetReader::new(&path, 0).unwrap();
         assert_eq!(reader.total_changes().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_total_changes_single_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.csoff");
+
+        {
+            let mut writer = ChangesetOffsetWriter::new(&path, 0).unwrap();
+            writer.append(&ChangesetOffset::new(0, 7)).unwrap();
+            writer.sync().unwrap();
+        }
+
+        let mut reader = ChangesetOffsetReader::new(&path, 1).unwrap();
+        assert_eq!(reader.total_changes().unwrap(), 7);
+    }
+
+    #[test]
+    fn test_total_changes_last_block_zero_changes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.csoff");
+
+        {
+            let mut writer = ChangesetOffsetWriter::new(&path, 0).unwrap();
+            writer.append(&ChangesetOffset::new(0, 5)).unwrap();
+            writer.append(&ChangesetOffset::new(5, 0)).unwrap();
+            writer.sync().unwrap();
+        }
+
+        let mut reader = ChangesetOffsetReader::new(&path, 2).unwrap();
+        // last record is (offset=5, num_changes=0), total = 5
+        assert_eq!(reader.total_changes().unwrap(), 5);
     }
 
     #[test]
