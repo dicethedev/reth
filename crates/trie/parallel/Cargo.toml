@@ -40,6 +40,7 @@ rayon.workspace = true
 itertools.workspace = true
 crossbeam-channel.workspace = true
 crossbeam-utils.workspace = true
+moka = { workspace = true, features = ["sync"] }
 
 # `metrics` feature
 reth-metrics = { workspace = true, optional = true }

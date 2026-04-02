@@ -1,10 +1,10 @@
-use crate::proof_task::StorageProofResultMessage;
+use crate::{proof_task::StorageProofResultMessage, StorageRootCache};
 use alloy_primitives::{map::B256Map, B256};
 use alloy_rlp::Encodable;
 use core::cell::RefCell;
 use crossbeam_channel::Receiver as CrossbeamReceiver;
 use reth_execution_errors::trie::StateProofError;
-use reth_primitives_traits::{dashmap::DashMap, Account};
+use reth_primitives_traits::Account;
 use reth_storage_errors::db::DatabaseError;
 use reth_trie::{
     hashed_cursor::HashedStorageCursor,
@@ -14,7 +14,6 @@ use reth_trie::{
 };
 use std::{
     rc::Rc,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -66,7 +65,7 @@ pub(crate) enum AsyncAccountDeferredValueEncoder<TC, HC> {
         /// root.
         storage_calculator: Rc<RefCell<StorageProofCalculator<TC, HC>>>,
         /// Cache to store computed storage roots for future reuse.
-        cached_storage_roots: Arc<DashMap<B256, B256>>,
+        cached_storage_roots: StorageRootCache,
     },
     /// The storage root was found in cache.
     FromCache { account: Account, root: B256 },
@@ -77,7 +76,7 @@ pub(crate) enum AsyncAccountDeferredValueEncoder<TC, HC> {
         hashed_address: B256,
         account: Account,
         /// Cache to store computed storage roots for future reuse.
-        cached_storage_roots: Arc<DashMap<B256, B256>>,
+        cached_storage_roots: StorageRootCache,
     },
 }
 
@@ -218,7 +217,7 @@ pub(crate) struct AsyncAccountValueEncoder<TC, HC> {
     /// If a proof was also dispatched for an account, the cached root can still be used to encode
     /// the account leaf immediately; the proof result is collected later in `finalize` so the
     /// multiproof nodes are not lost.
-    cached_storage_roots: Arc<DashMap<B256, B256>>,
+    cached_storage_roots: StorageRootCache,
     /// Tracks storage proof results received from the storage workers. [`Rc`] + [`RefCell`] is
     /// required because [`DeferredValueEncoder`] cannot have a lifetime.
     storage_proof_results: Rc<RefCell<B256Map<Vec<ProofTrieNodeV2>>>>,
@@ -239,7 +238,7 @@ impl<TC, HC> AsyncAccountValueEncoder<TC, HC> {
     /// - `storage_calculator`: Shared storage proof calculator for synchronous computation
     pub(crate) fn new(
         dispatched: B256Map<CrossbeamReceiver<StorageProofResultMessage>>,
-        cached_storage_roots: Arc<DashMap<B256, B256>>,
+        cached_storage_roots: StorageRootCache,
         storage_calculator: Rc<RefCell<StorageProofCalculator<TC, HC>>>,
     ) -> Self {
         Self {
@@ -310,7 +309,7 @@ where
         // account, `finalize` will collect its proof nodes later.
         if let Some(root) = self.cached_storage_roots.get(&hashed_address) {
             self.stats.borrow_mut().from_cache_count += 1;
-            return AsyncAccountDeferredValueEncoder::FromCache { account, root: *root }
+            return AsyncAccountDeferredValueEncoder::FromCache { account, root }
         }
 
         // If the proof job has already been dispatched for this account then it's not necessary to
@@ -388,7 +387,7 @@ mod tests {
         let mut dispatched = B256Map::default();
         dispatched.insert(hashed_address, result_rx);
 
-        let cached_storage_roots = Arc::<DashMap<_, _>>::default();
+        let cached_storage_roots = StorageRootCache::default();
         cached_storage_roots.insert(hashed_address, cached_root);
 
         let mut encoder = AsyncAccountValueEncoder::new(

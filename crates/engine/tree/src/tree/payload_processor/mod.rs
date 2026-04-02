@@ -30,6 +30,7 @@ use reth_trie::{hashed_cursor::HashedCursorFactory, trie_cursor::TrieCursorFacto
 use reth_trie_parallel::{
     proof_task::{ProofTaskCtx, ProofWorkerHandle},
     root::ParallelStateRootError,
+    StorageRootCache,
 };
 use reth_trie_sparse::{ConfigurableSparseTrie, SparseStateTrie};
 use std::{
@@ -49,9 +50,7 @@ pub mod prewarm;
 pub mod receipt_root_task;
 pub mod sparse_trie;
 
-use preserved_sparse_trie::{
-    PreservedStateRootAssets, SharedPreservedStateRootAssets, StorageRootCache,
-};
+use preserved_sparse_trie::{PreservedStateRootAssets, SharedPreservedStateRootAssets};
 
 /// Default node capacity for shrinking the sparse trie. This is used to limit the number of trie
 /// nodes in allocated sparse tries.
@@ -367,7 +366,7 @@ where
             &self.executor,
             task_ctx,
             halve_workers,
-            Arc::clone(&storage_root_cache),
+            storage_root_cache.clone(),
         );
 
         let (state_root_tx, state_root_rx) = channel();
@@ -1354,10 +1353,7 @@ mod tests {
         match preserved {
             PreservedStateRootAssets::Anchored { storage_root_cache, state_root, .. } => {
                 assert_eq!(state_root, outcome.state_root);
-                assert_eq!(
-                    storage_root_cache.get(&hashed_address).as_deref().copied(),
-                    Some(expected_storage_root),
-                );
+                assert_eq!(storage_root_cache.get(&hashed_address), Some(expected_storage_root));
             }
             PreservedStateRootAssets::Cleared { .. } => {
                 panic!("expected anchored state-root assets")

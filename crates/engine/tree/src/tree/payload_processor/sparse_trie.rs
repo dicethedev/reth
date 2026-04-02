@@ -1,5 +1,6 @@
 //! Sparse Trie task related functionality.
 
+use super::preserved_sparse_trie::StorageRootCache;
 use std::sync::Arc;
 
 use crate::tree::{
@@ -13,7 +14,7 @@ use alloy_primitives::{map::B256Set, B256};
 use alloy_rlp::{Decodable, Encodable};
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use reth_primitives_traits::{dashmap::DashMap, Account, FastInstant as Instant};
+use reth_primitives_traits::{Account, FastInstant as Instant};
 use reth_tasks::Runtime;
 use reth_trie::{
     updates::TrieUpdates, DecodedMultiProofV2, HashedPostState, TrieAccount, EMPTY_ROOT_HASH,
@@ -49,7 +50,7 @@ pub(super) struct SparseTrieCacheTask<A = ConfigurableSparseTrie, S = Configurab
     /// Handle to the proof worker pools (storage and account).
     proof_worker_handle: ProofWorkerHandle,
     /// Shared storage-root cache reused across continuation blocks.
-    storage_root_cache: Arc<DashMap<B256, B256>>,
+    storage_root_cache: StorageRootCache,
 
     /// The size of proof targets chunk to spawn in one calculation.
     /// If None, chunking is disabled and all targets are processed in a single proof.
@@ -123,7 +124,7 @@ where
         executor: &Runtime,
         updates: CrossbeamReceiver<StateRootMessage>,
         proof_worker_handle: ProofWorkerHandle,
-        storage_root_cache: Arc<DashMap<B256, B256>>,
+        storage_root_cache: StorageRootCache,
         metrics: MultiProofTaskMetrics,
         trie: SparseStateTrie<A, S>,
         chunk_size: usize,
@@ -511,7 +512,9 @@ where
         let mut dirty_accounts_cnt = 0;
 
         for address in dirty_accounts {
-            let root = self.trie.storage_root(&address)
+            let root = self
+                .trie
+                .storage_root(&address)
                 .expect("storage root must've been revealed if it ended up in dirty accounts");
             self.storage_root_cache.insert(address, root);
             dirty_accounts_cnt += 1;

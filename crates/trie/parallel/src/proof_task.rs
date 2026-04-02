@@ -31,6 +31,7 @@
 use crate::{
     root::ParallelStateRootError,
     value_encoder::{AsyncAccountValueEncoder, ValueEncoderStats},
+    StorageRootCache,
 };
 use alloy_primitives::{
     map::{B256Map, B256Set},
@@ -38,7 +39,7 @@ use alloy_primitives::{
 };
 use crossbeam_channel::{unbounded, Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use reth_execution_errors::{SparseTrieError, SparseTrieErrorKind, StateProofError};
-use reth_primitives_traits::{dashmap::DashMap, FastInstant as Instant};
+use reth_primitives_traits::FastInstant as Instant;
 use reth_provider::{DatabaseProviderROFactory, ProviderError, ProviderResult};
 use reth_storage_errors::db::DatabaseError;
 use reth_tasks::Runtime;
@@ -175,7 +176,7 @@ impl ProofWorkerHandle {
         runtime: &Runtime,
         task_ctx: ProofTaskCtx<Factory>,
         halve_workers: bool,
-        cached_storage_roots: Arc<DashMap<B256, B256>>,
+        cached_storage_roots: StorageRootCache,
     ) -> Self
     where
         Factory: DatabaseProviderROFactory<Provider: TrieCursorFactory + HashedCursorFactory>
@@ -669,7 +670,7 @@ struct StorageProofWorker<Factory> {
     /// Per-worker availability flags
     availability: Arc<AvailabilitySheet>,
     /// Cached storage roots
-    cached_storage_roots: Arc<DashMap<B256, B256>>,
+    cached_storage_roots: StorageRootCache,
     /// Metrics collector for this worker
     #[cfg(feature = "metrics")]
     metrics: ProofTaskTrieMetrics,
@@ -688,7 +689,7 @@ where
         work_rx: CrossbeamReceiver<StorageWorkerJob>,
         worker_id: usize,
         availability: Arc<AvailabilitySheet>,
-        cached_storage_roots: Arc<DashMap<B256, B256>>,
+        cached_storage_roots: StorageRootCache,
         #[cfg(feature = "metrics")] metrics: ProofTaskTrieMetrics,
         #[cfg(feature = "metrics")] cursor_metrics: ProofTaskCursorMetrics,
     ) -> Self {
@@ -945,7 +946,7 @@ struct AccountProofWorker<Factory> {
     /// Per-worker availability flags
     availability: Arc<AvailabilitySheet>,
     /// Cached storage roots
-    cached_storage_roots: Arc<DashMap<B256, B256>>,
+    cached_storage_roots: StorageRootCache,
     /// Metrics collector for this worker
     #[cfg(feature = "metrics")]
     metrics: ProofTaskTrieMetrics,
@@ -966,7 +967,7 @@ where
         worker_id: usize,
         storage_work_tx: CrossbeamSender<StorageWorkerJob>,
         availability: Arc<AvailabilitySheet>,
-        cached_storage_roots: Arc<DashMap<B256, B256>>,
+        cached_storage_roots: StorageRootCache,
         #[cfg(feature = "metrics")] metrics: ProofTaskTrieMetrics,
         #[cfg(feature = "metrics")] cursor_metrics: ProofTaskCursorMetrics,
     ) -> Self {
@@ -1405,7 +1406,7 @@ mod tests {
 
         let runtime = reth_tasks::Runtime::test();
         let proof_handle =
-            ProofWorkerHandle::new(&runtime, ctx, false, Arc::<DashMap<_, _>>::default());
+            ProofWorkerHandle::new(&runtime, ctx, false, StorageRootCache::default());
 
         // Verify handle can be cloned
         let _cloned_handle = proof_handle.clone();

@@ -11,6 +11,9 @@
 mod storage_root_targets;
 pub use storage_root_targets::StorageRootTargets;
 
+mod storage_root_cache;
+pub use storage_root_cache::StorageRootCache;
+
 /// Parallel trie calculation stats.
 pub mod stats;
 
