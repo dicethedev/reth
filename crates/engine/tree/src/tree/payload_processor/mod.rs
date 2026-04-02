@@ -954,13 +954,14 @@ where
 mod tests {
     use super::preserved_sparse_trie::PreservedStateRootAssets;
     use crate::tree::{
-        payload_processor::{evm_state_to_hashed_post_state, ExecutionEnv, PayloadProcessor},
+        payload_processor::{ExecutionEnv, PayloadProcessor},
         precompile_cache::PrecompileCacheMap,
         CachedStateMetrics, ExecutionCache, PayloadExecutionCache, SavedCache,
         StateProviderBuilder, TreeConfig,
     };
     use alloy_eips::eip1898::{BlockNumHash, BlockWithParent};
     use alloy_evm::block::StateChangeSource;
+    use alloy_primitives::keccak256;
     use rand::Rng;
     use reth_chainspec::ChainSpec;
     use reth_db_common::init::init_genesis;
@@ -1273,41 +1274,58 @@ mod tests {
     fn state_root_assets_publish_final_storage_roots() {
         reth_tracing::init_test_tracing();
 
-        let address = Address::from([0x11; 20]);
-        let slot = U256::from(42);
-        let value = U256::from(999);
-        let update = EvmState::from_iter([(
-            address,
-            revm_state::Account {
-                info: AccountInfo {
-                    balance: U256::from(100),
-                    nonce: 1,
-                    code_hash: KECCAK_EMPTY,
-                    code: Some(Default::default()),
-                    account_id: None,
-                },
-                original_info: Box::new(AccountInfo::default()),
-                storage: HashMap::from_iter([(
-                    slot,
-                    EvmStorageSlot::new_changed(U256::ZERO, value, 0),
-                )]),
-                status: AccountStatus::Touched,
-                transaction_id: 0,
-            },
-        )]);
-
-        let (payload_processor, computed_root) = process_state_updates(&[update.clone()]);
-
-        let slot_key = B256::from(slot.to_be_bytes::<32>());
-        let expected_storage_root = storage_root([(slot_key, value)]);
-        let expected_state_root = state_root([(
-            address,
+        // Multiple accounts with varying storage to exercise the full dirty-accounts drain loop
+        // in `publish_final_storage_roots`.
+        let test_accounts: Vec<(Address, u64, Vec<(U256, U256)>)> = vec![
             (
-                Account::from_revm_account(update.get(&address).unwrap()),
-                [(slot_key, value)],
+                Address::from([0x11; 20]),
+                1,
+                vec![(U256::from(1), U256::from(100)), (U256::from(2), U256::from(200))],
             ),
-        )]);
+            (Address::from([0x22; 20]), 2, vec![(U256::from(42), U256::from(999))]),
+            (
+                Address::from([0x33; 20]),
+                3,
+                vec![
+                    (U256::from(7), U256::from(77)),
+                    (U256::from(8), U256::from(88)),
+                    (U256::from(9), U256::from(99)),
+                ],
+            ),
+        ];
 
+        let update = EvmState::from_iter(test_accounts.iter().map(|(address, nonce, slots)| {
+            (
+                *address,
+                revm_state::Account {
+                    info: AccountInfo {
+                        balance: U256::from(1),
+                        nonce: *nonce,
+                        code_hash: KECCAK_EMPTY,
+                        code: Some(Default::default()),
+                        account_id: None,
+                    },
+                    original_info: Box::new(AccountInfo::default()),
+                    storage: HashMap::from_iter(slots.iter().map(|(slot, value)| {
+                        (*slot, EvmStorageSlot::new_changed(U256::ZERO, *value, 0))
+                    })),
+                    status: AccountStatus::Touched,
+                    transaction_id: 0,
+                },
+            )
+        }));
+
+        let (payload_processor, computed_root) = process_state_updates(&[update]);
+
+        let expected_state_root =
+            state_root(test_accounts.iter().map(|(address, nonce, slots)| {
+                let account =
+                    Account { nonce: *nonce, balance: U256::from(1), bytecode_hash: None };
+                let storage = slots
+                    .iter()
+                    .map(|(slot, value)| (B256::from(slot.to_be_bytes::<32>()), *value));
+                (*address, (account, storage))
+            }));
         assert_eq!(
             computed_root, expected_state_root,
             "State root mismatch: task={computed_root}, expected={expected_state_root}"
@@ -1318,15 +1336,19 @@ mod tests {
             .take()
             .expect("expected preserved state-root assets");
 
-        let hashed_post_state = evm_state_to_hashed_post_state(update);
-        let hashed_address =
-            *hashed_post_state.accounts.keys().next().expect("expected one account");
         match preserved {
             PreservedStateRootAssets::Anchored { storage_root_cache, .. } => {
-                assert_eq!(
-                    storage_root_cache.get(&hashed_address),
-                    Some(expected_storage_root),
-                );
+                for (address, _, slots) in &test_accounts {
+                    let hashed_address = keccak256(address);
+                    let expected = storage_root(slots.iter().map(|(slot, value)| {
+                        (B256::from(slot.to_be_bytes::<32>()), *value)
+                    }));
+                    assert_eq!(
+                        storage_root_cache.get(&hashed_address),
+                        Some(expected),
+                        "Storage root mismatch for {address}"
+                    );
+                }
             }
             PreservedStateRootAssets::Cleared { .. } => {
                 panic!("expected anchored state-root assets")
