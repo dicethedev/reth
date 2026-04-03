@@ -10,7 +10,7 @@ Runs the BAL generate/replay flow against a copied Hoodi datadir.
 The script:
 1. Refuses to run if the source datadir is already in use by another reth node.
 2. Copies the source datadir to a temporary work datadir.
-3. Starts a temporary `reth-bb` Hoodi node on the copied datadir.
+3. Starts a temporary `reth` Hoodi node on the copied datadir for RPC/BAL generation.
 4. Generates a BAL-backed big block payload with `generate-big-block`.
 5. Stops the node and unwinds the copied datadir back to `from-block - 1`.
 6. Restarts the node and replays the payload with `reth_newPayload`.
@@ -20,7 +20,8 @@ The script:
 Options:
   --datadir PATH         Source Hoodi datadir (default: /home/mediocregopher/src/ithaca/data/reth/hoodi)
   --workdir PATH         Parent directory for temporary workdirs (default: sibling of --datadir)
-  --node-bin PATH        node binary to use (default: <repo>/target/amp/debug/reth-bb)
+  --rpc-node-bin PATH    RPC node binary to use (default: <repo>/target/amp/debug/reth)
+  --replay-node-bin PATH Replay node binary to use (default: <repo>/target/amp/debug/reth-bb)
   --bench-bin PATH       reth-bench binary to use (default: <repo>/target/amp/debug/reth-bench)
   --from-block N         Explicit start block. If omitted, the script picks the best recent multi-block window.
   --target-gas VALUE     Target gas passed to generate-big-block (default: 1G)
@@ -32,8 +33,8 @@ Options:
   -h, --help             Show this help
 
 Notes:
-- The script uses `reth-bb` by default because true synthetic big blocks built
-  from many inner blocks exceed normal `reth` gas-limit and blob-gas validation.
+- The script uses normal `reth` for BAL generation and `reth-bb` for replay,
+  because true synthetic big blocks exceed normal `reth` gas-limit and blob-gas validation.
 - The source datadir is never unwound or modified.
 EOF
 }
@@ -47,7 +48,8 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 
 SOURCE_DATADIR=/home/mediocregopher/src/ithaca/data/reth/hoodi
 WORK_PARENT=
-NODE_BIN="$REPO_ROOT/target/amp/debug/reth-bb"
+RPC_NODE_BIN="$REPO_ROOT/target/amp/debug/reth"
+REPLAY_NODE_BIN="$REPO_ROOT/target/amp/debug/reth-bb"
 BENCH_BIN="$REPO_ROOT/target/amp/debug/reth-bench"
 FROM_BLOCK=
 TARGET_GAS=1G
@@ -68,8 +70,17 @@ while [[ $# -gt 0 ]]; do
             WORK_PARENT="$2"
             shift 2
             ;;
+        --rpc-node-bin)
+            RPC_NODE_BIN="$2"
+            shift 2
+            ;;
+        --replay-node-bin)
+            REPLAY_NODE_BIN="$2"
+            shift 2
+            ;;
         --node-bin|--reth-bin)
-            NODE_BIN="$2"
+            RPC_NODE_BIN="$2"
+            REPLAY_NODE_BIN="$2"
             shift 2
             ;;
         --bench-bin)
@@ -116,7 +127,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-for bin in "$NODE_BIN" "$BENCH_BIN"; do
+for bin in "$RPC_NODE_BIN" "$REPLAY_NODE_BIN" "$BENCH_BIN"; do
     if [[ ! -x "$bin" ]]; then
         echo "Expected executable binary at $bin" >&2
         exit 1
@@ -271,14 +282,16 @@ wait_for_rpc() {
 }
 
 start_node() {
+    local node_bin=$1
+    local role=$2
     local jwt_secret="$WORK_DATADIR/jwt.hex"
     if [[ ! -f "$jwt_secret" ]]; then
         openssl rand -hex 32 > "$jwt_secret"
     fi
 
-    log "Starting temporary Hoodi node on copied datadir $WORK_DATADIR"
+    log "Starting temporary Hoodi $role node on copied datadir $WORK_DATADIR"
     : > "$NODE_LOG"
-    nohup "$NODE_BIN" node \
+    nohup "$node_bin" node \
         --chain "$CHAIN" \
         --datadir "$WORK_DATADIR" \
         --http \
@@ -394,7 +407,7 @@ cleanup() {
 trap cleanup EXIT
 
 prepare_work_datadir
-start_node
+start_node "$RPC_NODE_BIN" "RPC"
 
 if [[ -z "$FROM_BLOCK" ]]; then
     selection=$(pick_from_block)
@@ -470,9 +483,9 @@ fi
 
 UNWIND_TARGET=$((FROM_BLOCK - 1))
 log "Unwinding copied datadir back to parent block $UNWIND_TARGET before replay"
-"$NODE_BIN" stage unwind --datadir "$WORK_DATADIR" --chain "$CHAIN" to-block "$UNWIND_TARGET" >> "$NODE_LOG" 2>&1
+"$RPC_NODE_BIN" stage unwind --datadir "$WORK_DATADIR" --chain "$CHAIN" to-block "$UNWIND_TARGET" >> "$NODE_LOG" 2>&1
 
-start_node
+start_node "$REPLAY_NODE_BIN" "replay"
 
 latest_before_replay=$(query_block_by_tag latest)
 actual_parent=$(LATEST_JSON="$latest_before_replay" python3 - <<'PY'
