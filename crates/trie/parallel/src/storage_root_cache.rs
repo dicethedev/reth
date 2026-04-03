@@ -4,7 +4,7 @@ use alloy_primitives::{map::DefaultHashBuilder, B256};
 use moka::policy::EvictionPolicy;
 
 /// Default max entry count for the shared storage-root cache.
-const DEFAULT_STORAGE_ROOT_CACHE_MAX_ENTRIES: u64 = 100_000;
+const DEFAULT_STORAGE_ROOT_CACHE_MAX_ENTRIES: u64 = 1_000_000;
 
 /// Concurrent LRU cache of storage roots shared across proof workers and continuation blocks.
 ///
