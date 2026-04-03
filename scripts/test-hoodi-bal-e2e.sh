@@ -25,6 +25,7 @@ Options:
   --bench-bin PATH       reth-bench binary to use (default: <repo>/target/amp/debug/reth-bench)
   --from-block N         Explicit start block. If omitted, the script picks the best recent multi-block window.
   --target-gas VALUE     Target gas passed to generate-big-block (default: 1G)
+  --num-big-blocks N     Number of sequential big blocks to generate and replay (default: 1)
   --search-blocks N      Recent blocks to scan when auto-picking --from-block (default: 10064)
   --rpc-port PORT        Temporary HTTP RPC port (default: 18545)
   --authrpc-port PORT    Temporary auth RPC port (default: 18551)
@@ -53,6 +54,7 @@ REPLAY_NODE_BIN="$REPO_ROOT/target/amp/debug/reth-bb"
 BENCH_BIN="$REPO_ROOT/target/amp/debug/reth-bench"
 FROM_BLOCK=
 TARGET_GAS=1G
+NUM_BIG_BLOCKS=1
 SEARCH_BLOCKS=10064
 RPC_PORT=18545
 AUTHRPC_PORT=18551
@@ -93,6 +95,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --target-gas)
             TARGET_GAS="$2"
+            shift 2
+            ;;
+        --num-big-blocks)
+            NUM_BIG_BLOCKS="$2"
             shift 2
             ;;
         --search-blocks)
@@ -428,6 +434,7 @@ log "Generating BAL payload from block $FROM_BLOCK with target gas $TARGET_GAS"
     --chain "$CHAIN" \
     --from-block "$FROM_BLOCK" \
     --target-gas "$TARGET_GAS" \
+    --num-big-blocks "$NUM_BIG_BLOCKS" \
     --output-dir "$PAYLOAD_DIR" \
     --bal \
     --ignore-blob-gas-limit
@@ -438,38 +445,53 @@ if [[ -z "$PAYLOAD_PATH" ]]; then
     exit 1
 fi
 
-payload_summary=$(PAYLOAD_PATH="$PAYLOAD_PATH" python3 - <<'PY'
+payload_summary=$(PAYLOAD_DIR="$PAYLOAD_DIR" EXPECTED_COUNT="$NUM_BIG_BLOCKS" python3 - <<'PY'
 import json, os
-path = os.environ['PAYLOAD_PATH']
-with open(path, 'r', encoding='utf-8') as fh:
-    data = json.load(fh)
-bal = data.get('block_access_list') or []
-switches = data['big_block_data']['env_switches']
-payload = data['execution_data']['payload']
-summary = {
-    'path': path,
-    'bal_accounts': len(bal),
-    'env_switches': len(switches),
-    'gas_used': int(payload['gasUsed'], 16),
-    'block_number': int(payload['blockNumber'], 16),
-    'block_hash': payload['blockHash'],
-}
-if summary['bal_accounts'] == 0:
-    raise SystemExit(f'Payload {path} does not contain a non-empty block_access_list')
-if summary['env_switches'] == 0:
-    raise SystemExit(f'Payload {path} was not constructed from multiple inner blocks')
-print(json.dumps(summary))
+from pathlib import Path
+
+payload_dir = Path(os.environ['PAYLOAD_DIR'])
+expected_count = int(os.environ['EXPECTED_COUNT'])
+paths = sorted(payload_dir.glob('big_block_*.json'))
+if len(paths) != expected_count:
+    raise SystemExit(f'Expected {expected_count} payloads, found {len(paths)} in {payload_dir}')
+
+summaries = []
+for path in paths:
+    with path.open('r', encoding='utf-8') as fh:
+        data = json.load(fh)
+    bal = data.get('block_access_list') or []
+    switches = data['big_block_data']['env_switches']
+    payload = data['execution_data']['payload']
+    summary = {
+        'path': str(path),
+        'bal_accounts': len(bal),
+        'env_switches': len(switches),
+        'gas_used': int(payload['gasUsed'], 16),
+        'block_number': int(payload['blockNumber'], 16),
+        'block_hash': payload['blockHash'],
+    }
+    if summary['bal_accounts'] == 0:
+        raise SystemExit(f'Payload {path} does not contain a non-empty block_access_list')
+    if summary['env_switches'] == 0:
+        raise SystemExit(f'Payload {path} was not constructed from multiple inner blocks')
+    summaries.append(summary)
+
+print(json.dumps({
+    'count': len(summaries),
+    'first': summaries[0],
+    'last': summaries[-1],
+}))
 PY
 )
 
 REPLAY_EXPECTED_NUMBER=$(PAYLOAD_SUMMARY="$payload_summary" python3 - <<'PY'
 import json, os
-print(json.loads(os.environ['PAYLOAD_SUMMARY'])['block_number'])
+print(json.loads(os.environ['PAYLOAD_SUMMARY'])['last']['block_number'])
 PY
 )
 REPLAY_EXPECTED_HASH=$(PAYLOAD_SUMMARY="$payload_summary" python3 - <<'PY'
 import json, os
-print(json.loads(os.environ['PAYLOAD_SUMMARY'])['block_hash'])
+print(json.loads(os.environ['PAYLOAD_SUMMARY'])['last']['block_hash'])
 PY
 )
 log "Verified generated payload: $payload_summary"
