@@ -3,10 +3,15 @@ use std::{future::Future, sync::Arc};
 use alloy_consensus::{BlockHeader, Eip2718EncodableReceipt, TxReceipt};
 use alloy_eips::{eip2718::Encodable2718, BlockId};
 use alloy_primitives::{map::AddressMap, Bytes, B256, U256, U64};
-use alloy_trie::{proof::ProofRetainer, root::adjust_index_for_rlp, HashBuilder};
+use alloy_trie::{
+    proof::{ProofNodes, ProofRetainer},
+    root::adjust_index_for_rlp,
+    HashBuilder,
+};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use jsonrpsee::{core::RpcResult, PendingSubscriptionSink, SubscriptionMessage, SubscriptionSink};
+use parking_lot::Mutex;
 use reth_chain_state::{
     CanonStateNotification, CanonStateSubscriptions, ForkChoiceSubscriptions,
     PersistedBlockSubscriptions,
@@ -23,6 +28,7 @@ use reth_storage_api::{
 };
 use reth_tasks::{pool::BlockingTaskGuard, Runtime};
 use reth_trie_common::Nibbles;
+use schnellru::{ByLength, LruMap};
 use serde::Serialize;
 use tokio::sync::oneshot;
 
@@ -53,8 +59,15 @@ impl<Provider, EvmConfig> RethApi<Provider, EvmConfig> {
         blocking_task_guard: BlockingTaskGuard,
         task_spawner: Runtime,
     ) -> Self {
-        let inner =
-            Arc::new(RethApiInner { provider, evm_config, blocking_task_guard, task_spawner });
+        let inner = Arc::new(RethApiInner {
+            provider,
+            evm_config,
+            blocking_task_guard,
+            task_spawner,
+            receipt_proof_cache: Mutex::new(LruMap::new(ByLength::new(
+                DEFAULT_RECEIPT_PROOF_CACHE_SIZE,
+            ))),
+        });
         Self { inner }
     }
 }
@@ -146,6 +159,36 @@ where
             .ok_or(EthApiError::HeaderNotFound(block_hash.into()))?;
         let receipts_root = header.receipts_root();
 
+        // Check the cache first.
+        {
+            let mut cache = self.inner.receipt_proof_cache.lock();
+            if let Some(cached) = cache.get(&block_hash) {
+                if tx_index >= cached.encoded_receipts.len() {
+                    return Err(EthApiError::InvalidParams(format!(
+                        "tx index {tx_index} out of bounds for block with {} receipts",
+                        cached.encoded_receipts.len()
+                    )));
+                }
+
+                let target_nibbles = Nibbles::unpack(alloy_rlp::encode_fixed_size(&tx_index));
+                let proof = cached
+                    .proof_nodes
+                    .matching_nodes_sorted(&target_nibbles)
+                    .into_iter()
+                    .map(|(_, node)| node)
+                    .collect();
+
+                return Ok(Some(ReceiptWithProofResponse {
+                    receipt: cached.encoded_receipts[tx_index].clone(),
+                    proof,
+                    receipts_root,
+                    block_hash,
+                    tx_index: meta.index,
+                }));
+            }
+        }
+
+        // Cache miss — build the trie, cache it, and extract the proof.
         let receipts = self
             .provider()
             .receipts_by_block(block_hash.into())?
@@ -158,11 +201,25 @@ where
             )));
         }
 
-        let (target_receipt_bytes, proof) =
-            build_receipt_proof(&receipts, tx_index).map_err(|_| EthApiError::InternalEthError)?;
+        let cached = build_receipts_trie(&receipts);
+        if cached.root != receipts_root {
+            return Err(EthApiError::InternalEthError);
+        }
+
+        let target_nibbles = Nibbles::unpack(alloy_rlp::encode_fixed_size(&tx_index));
+        let proof = cached
+            .proof_nodes
+            .matching_nodes_sorted(&target_nibbles)
+            .into_iter()
+            .map(|(_, node)| node)
+            .collect();
+        let receipt = cached.encoded_receipts[tx_index].clone();
+
+        // Insert into cache.
+        self.inner.receipt_proof_cache.lock().insert(block_hash, cached);
 
         Ok(Some(ReceiptWithProofResponse {
-            receipt: target_receipt_bytes,
+            receipt,
             proof,
             receipts_root,
             block_hash,
@@ -447,6 +504,9 @@ impl<Provider, EvmConfig> Clone for RethApi<Provider, EvmConfig> {
     }
 }
 
+/// Default number of blocks to cache receipt tries for.
+const DEFAULT_RECEIPT_PROOF_CACHE_SIZE: u32 = 64;
+
 struct RethApiInner<Provider, EvmConfig> {
     /// The provider that can interact with the chain.
     provider: Provider,
@@ -456,6 +516,56 @@ struct RethApiInner<Provider, EvmConfig> {
     blocking_task_guard: BlockingTaskGuard,
     /// The type that can spawn tasks which would otherwise block.
     task_spawner: Runtime,
+    /// LRU cache of receipts trie proof nodes, keyed by block hash.
+    /// Avoids rebuilding the trie when multiple users query proofs from the same block.
+    receipt_proof_cache: Mutex<LruMap<B256, CachedReceiptsTrie>>,
+}
+
+/// Cached receipts trie data for a single block.
+///
+/// Built once on first proof request for a block, then reused for all subsequent
+/// requests targeting any tx index in the same block.
+struct CachedReceiptsTrie {
+    /// EIP-2718 encoded receipts, indexed by tx position.
+    encoded_receipts: Vec<Bytes>,
+    /// All trie proof nodes retained during trie construction.
+    proof_nodes: ProofNodes,
+    /// The computed receipts root (must match the block header).
+    root: B256,
+}
+
+/// Builds the full receipts trie with all proof nodes retained.
+///
+/// This is used to build a [`CachedReceiptsTrie`] that can serve proofs for any tx index
+/// without rebuilding the trie.
+fn build_receipts_trie<R: TxReceipt + Eip2718EncodableReceipt + Send + Sync>(
+    receipts: &[R],
+) -> CachedReceiptsTrie {
+    let len = receipts.len();
+
+    // Retain proof nodes for ALL tx indices.
+    let all_targets: Vec<Nibbles> =
+        (0..len).map(|i| Nibbles::unpack(alloy_rlp::encode_fixed_size(&i))).collect();
+    let retainer = ProofRetainer::from_iter(all_targets);
+    let mut hb = HashBuilder::default().with_proof_retainer(retainer);
+
+    let mut encoded_receipts = vec![Bytes::new(); len];
+    let mut buf = Vec::new();
+
+    for i in 0..len {
+        let exec_index = adjust_index_for_rlp(i, len);
+        buf.clear();
+        receipts[exec_index].with_bloom_ref().encode_2718(&mut buf);
+        encoded_receipts[exec_index] = Bytes::copy_from_slice(&buf);
+
+        let index_buffer = alloy_rlp::encode_fixed_size(&exec_index);
+        hb.add_leaf(Nibbles::unpack(&index_buffer), &buf);
+    }
+
+    let root = hb.root();
+    let proof_nodes = hb.take_proof_nodes();
+
+    CachedReceiptsTrie { encoded_receipts, proof_nodes, root }
 }
 
 /// Builds a Merkle proof for a specific receipt within a list of receipts.
