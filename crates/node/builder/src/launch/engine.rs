@@ -106,7 +106,7 @@ impl EngineNodeLauncher {
             .with_provider_factory::<_, <CB::Components as NodeComponents<T>>::Evm>(changeset_cache.clone(), rocksdb_provider).await?
             .inspect(|this| {
                 info!(target: "reth::cli", "Database opened");
-                this.prewarm_db_pages(10_000);
+                this.prewarm_db_pages(1000);
             })
             .with_prometheus_server().await?
             .inspect(|this| {
