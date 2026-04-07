@@ -5,11 +5,9 @@ use alloy_primitives::{
     Bytes,
 };
 use moka::policy::EvictionPolicy;
-use reth_evm::precompiles::{
-    DynPrecompile, Precompile, PrecompileInput, PrecompileOutputExt, PrecompileResultExt,
-};
+use reth_evm::precompiles::{DynPrecompile, Precompile, PrecompileInput, PrecompileResultExt};
 use reth_primitives_traits::dashmap::DashMap;
-use revm::precompile::PrecompileId;
+use revm::precompile::{PrecompileId, PrecompileOutput};
 use revm_primitives::Address;
 use std::{hash::Hash, sync::Arc};
 
@@ -78,13 +76,13 @@ where
 /// Cache entry, precompile successful output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheEntry<S> {
-    output: PrecompileOutputExt,
+    output: PrecompileOutput,
     spec: S,
 }
 
 impl<S> CacheEntry<S> {
     const fn regular_gas_used(&self) -> u64 {
-        self.output.gas.limit() - self.output.gas.remaining()
+        self.output.gas_used
     }
 
     fn to_precompile_result(&self) -> PrecompileResultExt {
@@ -230,28 +228,24 @@ mod tests {
     use super::*;
     use reth_evm::{EthEvmFactory, Evm, EvmEnv, EvmFactory};
     use reth_revm::db::EmptyDB;
-    use revm::{context::TxEnv, interpreter::gas::GasTracker};
+    use revm::context::TxEnv;
     use revm_primitives::hardfork::SpecId;
 
     #[test]
     fn test_precompile_cache_basic() {
         let dyn_precompile: DynPrecompile = (|_input: PrecompileInput<'_>| -> PrecompileResultExt {
-            Ok(PrecompileOutputExt {
-                gas: GasTracker::new(0, 0, 0),
-                bytes: Bytes::default(),
-                reverted: false,
-            })
+            Ok(PrecompileOutput::new(0, Bytes::default(), 0))
         })
         .into();
 
         let cache =
             CachedPrecompile::new(dyn_precompile, PrecompileCache::default(), SpecId::PRAGUE, None);
 
-        let output = PrecompileOutputExt {
-            gas: GasTracker::new(50, 0, 0),
-            bytes: alloy_primitives::Bytes::copy_from_slice(b"cached_result"),
-            reverted: false,
-        };
+        let output = PrecompileOutput::new(
+            50,
+            alloy_primitives::Bytes::copy_from_slice(b"cached_result"),
+            0,
+        );
 
         let input = b"test_input";
         let expected = CacheEntry { output, spec: SpecId::PRAGUE };
@@ -278,11 +272,11 @@ mod tests {
             move |input: PrecompileInput<'_>| -> PrecompileResultExt {
                 assert_eq!(input.data, input_data);
 
-                Ok(PrecompileOutputExt {
-                    gas: GasTracker::new(5000, 0, 0),
-                    bytes: alloy_primitives::Bytes::copy_from_slice(b"output_from_precompile_1"),
-                    reverted: false,
-                })
+                Ok(PrecompileOutput::new(
+                    5000,
+                    alloy_primitives::Bytes::copy_from_slice(b"output_from_precompile_1"),
+                    0,
+                ))
             }
         })
             .into();
@@ -292,11 +286,11 @@ mod tests {
             move |input: PrecompileInput<'_>| -> PrecompileResultExt {
                 assert_eq!(input.data, input_data);
 
-                Ok(PrecompileOutputExt {
-                    gas: GasTracker::new(7000, 0, 0),
-                    bytes: alloy_primitives::Bytes::copy_from_slice(b"output_from_precompile_2"),
-                    reverted: false,
-                })
+                Ok(PrecompileOutput::new(
+                    7000,
+                    alloy_primitives::Bytes::copy_from_slice(b"output_from_precompile_2"),
+                    0,
+                ))
             }
         })
             .into();
