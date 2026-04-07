@@ -738,15 +738,15 @@ ipnet = "2.11"
 # jsonrpsee-http-client = { git = "https://github.com/paradigmxyz/jsonrpsee", branch = "matt/make-rpc-service-pub" }
 # jsonrpsee-types = { git = "https://github.com/paradigmxyz/jsonrpsee", branch = "matt/make-rpc-service-pub" }
 
-alloy-evm = { git = "https://github.com/alloy-rs/evm", rev = "1129fef3417e96fc8bee27617e9a8c0f038b771e" }
+alloy-evm = { git = "https://github.com/alloy-rs/evm", rev = "ae3f2a46161d419774007f3e9328fbcb248319d6" }
 
-revm-inspectors = { git = "https://github.com/paradigmxyz/revm-inspectors", rev = "8190865c59ea8e0f518e0ee127fd496f5f645bdd" }
+revm-inspectors = { git = "https://github.com/paradigmxyz/revm-inspectors", rev = "d727dba4eda94ea60d2d107abc5263db567b1957" }
 
 # revm from rakita/state-gas branch
-revm = { git = "https://github.com/bluealloy/revm", rev = "44a4233dbce8c283421cb568051fbba9d37894b0" }
-revm-bytecode = { git = "https://github.com/bluealloy/revm", rev = "44a4233dbce8c283421cb568051fbba9d37894b0" }
-revm-database = { git = "https://github.com/bluealloy/revm", rev = "44a4233dbce8c283421cb568051fbba9d37894b0" }
-revm-state = { git = "https://github.com/bluealloy/revm", rev = "44a4233dbce8c283421cb568051fbba9d37894b0" }
-revm-primitives = { git = "https://github.com/bluealloy/revm", rev = "44a4233dbce8c283421cb568051fbba9d37894b0" }
-revm-interpreter = { git = "https://github.com/bluealloy/revm", rev = "44a4233dbce8c283421cb568051fbba9d37894b0" }
-revm-database-interface = { git = "https://github.com/bluealloy/revm", rev = "44a4233dbce8c283421cb568051fbba9d37894b0" }
+revm = { git = "https://github.com/bluealloy/revm", rev = "a357a608d3ac327326abaaf70b1ec1a5d2c57542" }
+revm-bytecode = { git = "https://github.com/bluealloy/revm", rev = "a357a608d3ac327326abaaf70b1ec1a5d2c57542" }
+revm-database = { git = "https://github.com/bluealloy/revm", rev = "a357a608d3ac327326abaaf70b1ec1a5d2c57542" }
+revm-state = { git = "https://github.com/bluealloy/revm", rev = "a357a608d3ac327326abaaf70b1ec1a5d2c57542" }
+revm-primitives = { git = "https://github.com/bluealloy/revm", rev = "a357a608d3ac327326abaaf70b1ec1a5d2c57542" }
+revm-interpreter = { git = "https://github.com/bluealloy/revm", rev = "a357a608d3ac327326abaaf70b1ec1a5d2c57542" }
+revm-database-interface = { git = "https://github.com/bluealloy/revm", rev = "a357a608d3ac327326abaaf70b1ec1a5d2c57542" }
