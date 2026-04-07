@@ -265,13 +265,6 @@ pub struct Command {
     /// the flattened BAL on the stored payload.
     #[arg(long, default_value_t = false)]
     bal: bool,
-
-    /// Ignore the per-block blob gas cap when merging blocks.
-    ///
-    /// This is useful for constructing synthetic stress-test payloads for `reth-bb`,
-    /// which intentionally skips blob gas validation for imported big blocks.
-    #[arg(long, default_value_t = false, verbatim_doc_comment)]
-    ignore_blob_gas_limit: bool,
 }
 
 impl Command {
@@ -335,8 +328,6 @@ impl Command {
             let mut block_receipts: Vec<Vec<Receipt>> = Vec::new();
             let mut block_access_lists: Vec<Option<BlockAccessList>> = Vec::new();
             let mut accumulated_block_gas: u64 = 0;
-            let mut accumulated_blob_gas: u64 = 0;
-            let mut max_blob_gas_per_merged_block: Option<u64> = None;
 
             let mut reached_chain_tip = false;
             while accumulated_block_gas < self.target_gas {
@@ -409,30 +400,6 @@ impl Command {
                 let block_gas = execution_data.payload.as_v1().gas_used;
                 let block_blob_gas =
                     execution_data.payload.as_v3().map(|v3| v3.blob_gas_used).unwrap_or(0);
-                let max_blob_gas_per_merged_block = *max_blob_gas_per_merged_block
-                    .get_or_insert_with(|| {
-                        chain_spec
-                            .blob_params_at_timestamp(execution_data.payload.as_v1().timestamp)
-                            .map(|params| params.max_blob_gas_per_block())
-                            .unwrap_or(u64::MAX)
-                    });
-
-                if !self.ignore_blob_gas_limit &&
-                    !blocks.is_empty() &&
-                    accumulated_blob_gas.saturating_add(block_blob_gas) >
-                        max_blob_gas_per_merged_block
-                {
-                    info!(
-                        target: "reth-bench",
-                        block_number,
-                        block_blob_gas,
-                        accumulated_blob_gas,
-                        max_blob_gas_per_merged_block,
-                        big_block = big_block_idx,
-                        "Stopping merge before block because blob gas would exceed the per-block limit"
-                    );
-                    break;
-                }
 
                 info!(
                     target: "reth-bench",
@@ -445,7 +412,6 @@ impl Command {
                 );
 
                 accumulated_block_gas += block_gas;
-                accumulated_blob_gas += block_blob_gas;
                 blocks.push(execution_data);
                 block_receipts.push(consensus_receipts);
                 block_access_lists.push(block_access_list);
