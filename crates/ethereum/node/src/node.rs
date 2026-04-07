@@ -1,6 +1,5 @@
 //! Ethereum Node types config.
 
-pub use crate::{payload::EthereumPayloadBuilder, EthereumEngineValidator};
 use crate::{EthEngineTypes, EthEvmConfig};
 use alloy_eips::{eip7840::BlobParams, merge::EPOCH_SLOTS};
 use alloy_network::Ethereum;
@@ -14,6 +13,7 @@ use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
 use reth_evm::{
     eth::spec::EthExecutorSpec, ConfigureEvm, EvmFactory, EvmFactoryFor, NextBlockEnvAttributes,
 };
+use reth_evm_ethereum::factory::{JitBackend, RevmcMetrics, RuntimeConfig, RuntimeTuning};
 use reth_network::{primitives::BasicNetworkPrimitives, NetworkHandle, PeersInfo};
 use reth_node_api::{
     AddOnsContext, FullNodeComponents, HeaderTy, NodeAddOns, NodePrimitives,
@@ -60,6 +60,8 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
+
+pub use crate::{payload::EthereumPayloadBuilder, EthereumEngineValidator};
 
 /// Type configuration for a regular Ethereum node.
 #[derive(Debug, Default, Clone, Copy)]
@@ -440,28 +442,33 @@ where
     type EVM = EthEvmConfig<Types::ChainSpec, reth_evm_ethereum::factory::RethEvmFactory>;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
-        use reth_evm_ethereum::factory::{JitBackend, RevmcMetrics, RuntimeConfig, RuntimeTuning};
-
         let jit = &ctx.config().jit;
         let default_tuning = RuntimeTuning::default();
         let tuning = RuntimeTuning {
-            jit_hot_threshold: jit.hot_threshold,
             lookup_event_channel_capacity: jit.channel_capacity,
+            jit_hot_threshold: jit.hot_threshold,
             max_pending_jit_jobs: jit.max_pending_jobs,
-
             jit_worker_count: jit.worker_count.unwrap_or(default_tuning.jit_worker_count),
             resident_code_cache_bytes: jit.code_cache_bytes,
             idle_evict_duration: (jit.idle_evict_secs > 0)
                 .then(|| Duration::from_secs(jit.idle_evict_secs)),
-            ..default_tuning
-        };
 
-        let dump_dir = jit.debug.then(|| ctx.config().datadir().data_dir().join("jit"));
+            shutdown_timeout: default_tuning.shutdown_timeout,
+            jit_max_bytecode_len: default_tuning.jit_max_bytecode_len,
+            jit_worker_queue_capacity: default_tuning.jit_worker_queue_capacity,
+            jit_opt_level: default_tuning.jit_opt_level,
+            aot_opt_level: default_tuning.aot_opt_level,
+            eviction_sweep_interval: default_tuning.eviction_sweep_interval,
+        };
 
         let revmc_metrics = Arc::new(RevmcMetrics::default());
         let compilation_metrics = revmc_metrics.clone();
+        let dump_dir = jit.debug.then(|| ctx.config().datadir().data_dir().join("jit"));
+        let default_config = RuntimeConfig::default();
         let config = RuntimeConfig {
             enabled: jit.enabled || jit.blocking,
+            thread_name: default_config.thread_name,
+            store: default_config.store,
             tuning,
             dump_dir,
             debug_assertions: jit.debug,
@@ -469,7 +476,6 @@ where
             on_compilation: Some(Arc::new(move |event| {
                 compilation_metrics.record_compilation(&event);
             })),
-            ..Default::default()
         };
         let backend = JitBackend::start(config)?;
 

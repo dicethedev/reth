@@ -11,9 +11,8 @@ use revm::{
     primitives::hardfork::SpecId,
     Inspector,
 };
-use revmc::alloy_evm as jit;
+use revmc::alloy_evm::JitEvmFactory;
 
-pub use jit::JitEvm;
 pub use revmc::{
     runtime::{
         CompilationEvent, CompilationKind, JitBackend, RuntimeConfig, RuntimeStatsSnapshot,
@@ -27,9 +26,7 @@ pub use revmc::{
 /// Owns the [`JitBackend`] to keep it alive for the factory's lifetime.
 #[derive(Clone)]
 pub struct RethEvmFactory {
-    inner: jit::JitEvmFactory,
-    /// Keeps the backend alive.
-    _backend: JitBackend,
+    inner: JitEvmFactory,
 }
 
 impl core::fmt::Debug for RethEvmFactory {
@@ -41,7 +38,7 @@ impl core::fmt::Debug for RethEvmFactory {
 impl RethEvmFactory {
     /// Creates a new factory that owns the backend.
     pub fn new(backend: JitBackend) -> Self {
-        Self { inner: jit::JitEvmFactory::new(backend.clone()), _backend: backend }
+        Self { inner: JitEvmFactory::new(backend) }
     }
 
     /// Creates a [`RethEvmFactory`] with JIT disabled.
@@ -56,14 +53,14 @@ impl RethEvmFactory {
 
 impl EvmFactory for RethEvmFactory {
     type Evm<DB: Database, I: Inspector<alloy_evm::eth::EthEvmContext<DB>>> =
-        <jit::JitEvmFactory as EvmFactory>::Evm<DB, I>;
-    type Context<DB: Database> = <jit::JitEvmFactory as EvmFactory>::Context<DB>;
-    type Tx = <jit::JitEvmFactory as EvmFactory>::Tx;
+        <JitEvmFactory as EvmFactory>::Evm<DB, I>;
+    type Context<DB: Database> = <JitEvmFactory as EvmFactory>::Context<DB>;
+    type Tx = <JitEvmFactory as EvmFactory>::Tx;
     type Error<DBError: core::error::Error + Send + Sync + 'static> = EVMError<DBError>;
     type HaltReason = HaltReason;
     type Spec = SpecId;
     type BlockEnv = BlockEnv;
-    type Precompiles = <jit::JitEvmFactory as EvmFactory>::Precompiles;
+    type Precompiles = <JitEvmFactory as EvmFactory>::Precompiles;
 
     fn create_evm<DB: Database>(&self, db: DB, input: EvmEnv) -> Self::Evm<DB, NoOpInspector> {
         self.inner.create_evm(db, input)
