@@ -12,6 +12,7 @@
 pub extern crate reth_mdbx_sys as ffi;
 
 pub use crate::{
+    cache::CacheStore,
     codec::*,
     cursor::{Cursor, Iter, IterDup},
     database::Database,
@@ -27,6 +28,7 @@ pub use crate::{
 #[cfg(feature = "read-tx-timeouts")]
 pub use crate::environment::read_transactions::MaxReadTransactionDuration;
 
+mod cache;
 mod codec;
 mod cursor;
 mod database;

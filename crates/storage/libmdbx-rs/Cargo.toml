@@ -23,12 +23,12 @@ smallvec.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
-dashmap = { workspace = true, features = ["inline"], optional = true }
+dashmap = { workspace = true, features = ["inline"] }
 
 [features]
 default = []
 return-borrowed = []
-read-tx-timeouts = ["dep:dashmap"]
+read-tx-timeouts = []
 
 [dev-dependencies]
 tempfile.workspace = true

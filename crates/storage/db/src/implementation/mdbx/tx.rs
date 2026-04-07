@@ -295,7 +295,7 @@ impl<K: TransactionKind> DbTx for Tx<K> {
         key: &<T::Key as Encode>::Encoded,
     ) -> Result<Option<T::Value>, DatabaseError> {
         self.execute_with_operation_metric::<T, _>(Operation::Get, None, |tx| {
-            tx.get(self.get_dbi::<T>()?, key.as_ref())
+            tx.get_cached(self.get_dbi::<T>()?, key.as_ref())
                 .map_err(|e| DatabaseError::Read(e.into()))?
                 .map(decode_one::<T>)
                 .transpose()

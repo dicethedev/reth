@@ -1,4 +1,5 @@
 use crate::{
+    cache::CacheStore,
     database::Database,
     error::{mdbx_result, Error, Result},
     flags::EnvironmentFlags,
@@ -87,6 +88,12 @@ impl Environment {
     #[inline]
     pub(crate) fn txn_manager(&self) -> &TxnManager {
         &self.inner.txn_manager
+    }
+
+    /// Returns the B-tree traversal cache store.
+    #[inline]
+    pub fn cache_store(&self) -> &CacheStore {
+        &self.inner.cache_store
     }
 
     /// Returns the number of timed out transactions that were not aborted by the user yet.
@@ -254,6 +261,8 @@ struct EnvironmentInner {
     txn_manager: TxnManager,
     /// Pool of reset read-only transaction handles for reuse.
     ro_txn_pool: ReadTxnPool,
+    /// B-tree traversal cache for `mdbx_cache_get`.
+    cache_store: CacheStore,
 }
 
 impl Drop for EnvironmentInner {
@@ -779,6 +788,7 @@ impl EnvironmentBuilder {
             txn_manager,
             env_kind: self.kind,
             ro_txn_pool: ReadTxnPool::new(),
+            cache_store: CacheStore::new(),
         };
 
         Ok(Environment { inner: Arc::new(env) })

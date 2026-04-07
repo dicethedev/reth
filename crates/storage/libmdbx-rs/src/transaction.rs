@@ -8,6 +8,7 @@ use crate::{
 };
 use ffi::{MDBX_txn_flags_t, MDBX_TXN_RDONLY, MDBX_TXN_READWRITE};
 use parking_lot::{Mutex, MutexGuard};
+use smallvec::SmallVec;
 use std::{
     ffi::{c_uint, c_void},
     fmt::{self, Debug},
@@ -160,6 +161,37 @@ where
 
         self.txn_execute(|txn| unsafe {
             match ffi::mdbx_get(txn, dbi, &key_val, &mut data_val) {
+                ffi::MDBX_SUCCESS => Key::decode_val::<K>(txn, data_val).map(Some),
+                ffi::MDBX_NOTFOUND => Ok(None),
+                err_code => Err(Error::from_err_code(err_code)),
+            }
+        })?
+    }
+
+    /// Gets an item from a database using the B-tree traversal cache.
+    ///
+    /// Like [`get`](Self::get), but uses [`ffi::mdbx_cache_get`] with a per-key
+    /// [`ffi::MDBX_cache_entry_t`] stored in the environment's [`CacheStore`](crate::CacheStore).
+    /// On repeated lookups of the same key, this can skip B-tree traversal entirely when the
+    /// target page hasn't been modified since the last access.
+    pub fn get_cached<Key>(&self, dbi: ffi::MDBX_dbi, key: &[u8]) -> Result<Option<Key>>
+    where
+        Key: TableObject,
+    {
+        let key_val: ffi::MDBX_val =
+            ffi::MDBX_val { iov_len: key.len(), iov_base: key.as_ptr() as *mut c_void };
+        let mut data_val: ffi::MDBX_val = ffi::MDBX_val { iov_len: 0, iov_base: ptr::null_mut() };
+
+        let cache_key = (dbi, SmallVec::from_slice(key));
+        let cache_store = self.env().cache_store();
+
+        // Get or insert a zeroed cache entry (equivalent to mdbx_cache_init).
+        let mut entry =
+            cache_store.map().entry(cache_key).or_insert_with(|| unsafe { std::mem::zeroed() });
+
+        self.txn_execute(|txn| unsafe {
+            let result = ffi::mdbx_cache_get(txn, dbi, &key_val, &mut data_val, entry.value_mut());
+            match result.errcode {
                 ffi::MDBX_SUCCESS => Key::decode_val::<K>(txn, data_val).map(Some),
                 ffi::MDBX_NOTFOUND => Ok(None),
                 err_code => Err(Error::from_err_code(err_code)),
