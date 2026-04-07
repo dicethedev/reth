@@ -84,6 +84,14 @@ pub struct Command {
     #[arg(long, default_value = "false", verbatim_doc_comment)]
     reth_new_payload: bool,
 
+    /// Forward embedded block access lists to `reth_newPayload` when payload files contain them.
+    ///
+    /// Disabled by default so the same payload set can be replayed with or without BALs.
+    ///
+    /// Requires `--reth-new-payload`.
+    #[arg(long, default_value = "false", verbatim_doc_comment, requires = "reth_new_payload")]
+    bal: bool,
+
     /// Control when `reth_newPayload` waits for in-flight persistence.
     ///
     /// Accepts `always` (default — wait on every block), `never`, or a number N
@@ -142,6 +150,9 @@ impl Command {
         }
         if self.reth_new_payload {
             info!("Using reth_newPayload and reth_forkchoiceUpdated endpoints");
+            if self.bal {
+                info!(target: "reth-bench", "Forwarding embedded block_access_list data");
+            }
         }
 
         let mut metrics_scraper = MetricsScraper::maybe_new(self.metrics_url.clone());
@@ -188,13 +199,13 @@ impl Command {
         }
         info!(target: "reth-bench", count = payloads.len(), "Loaded main payloads from disk");
 
+        let has_env_switches = payloads.iter().any(|p| !p.big_block_data.env_switches.is_empty());
+        let has_block_access_lists = payloads.iter().any(|p| {
+            p.block_access_list.as_ref().is_some_and(|bal: &BlockAccessList| !bal.is_empty())
+        });
+
         // If any payload has env_switches but we're not using reth_newPayload, warn the user
         if !self.reth_new_payload {
-            let has_env_switches =
-                payloads.iter().any(|p| !p.big_block_data.env_switches.is_empty());
-            let has_block_access_lists = payloads.iter().any(|p| {
-                p.block_access_list.as_ref().is_some_and(|bal: &BlockAccessList| !bal.is_empty())
-            });
             if has_env_switches {
                 warn!(
                     target: "reth-bench",
@@ -209,6 +220,11 @@ impl Command {
                      BALs are only forwarded with reth_newPayload and will be ignored."
                 );
             }
+        } else if has_block_access_lists && !self.bal {
+            info!(
+                target: "reth-bench",
+                "Payloads contain block_access_list data but --bal is not set. BALs will be ignored."
+            );
         }
 
         let mut parent_hash = initial_parent_hash;
@@ -262,7 +278,7 @@ impl Command {
                         RethNewPayloadInput::ExecutionData(execution_data.clone()),
                         wait_for_persistence,
                         self.no_wait_for_caches.then_some(false),
-                        payload.block_access_list.clone(),
+                        self.bal.then(|| payload.block_access_list.clone()).flatten(),
                         big_block_data_param,
                     ))?,
                 )

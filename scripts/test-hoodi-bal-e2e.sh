@@ -526,6 +526,7 @@ log "Replaying payload through reth_newPayload"
     --engine-rpc-url "$(authrpc_url)" \
     --jwt-secret "$WORK_DATADIR/jwt.hex" \
     --reth-new-payload \
+    --bal \
     2>&1 | tee "$REPLAY_LOG"
 
 latest_after_replay=$(query_block_by_tag latest)
