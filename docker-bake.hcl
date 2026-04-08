@@ -50,7 +50,7 @@ group "default" {
 }
 
 group "nightly" {
-  targets = ["ethereum", "ethereum-profiling"]
+  targets = ["ethereum-nightly", "ethereum-profiling"]
 }
 
 // Base target with shared configuration
@@ -87,6 +87,15 @@ target "ethereum" {
     MANIFEST_PATH = "bin/reth"
   }
   tags = ["${REGISTRY}/reth:${TAG}"]
+}
+
+// Nightly ethereum with jemalloc heap profiling support
+target "ethereum-nightly" {
+  inherits = ["ethereum"]
+  args = {
+    FEATURES = "jemalloc-prof"
+  }
+  tags = ["${REGISTRY}/reth:nightly"]
 }
 
 target "ethereum-profiling" {
