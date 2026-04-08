@@ -430,7 +430,13 @@ impl<N: ProviderNodeTypes> Pipeline<N> {
 
         let stage_id = self.stage(stage_index).id();
         let mut made_progress = false;
-        let target = self.max_block.or(previous_stage);
+        // Use min(max_block, previous_stage) so that a stage never targets beyond what
+        // the previous stage has processed. This is needed when max_blocks_per_run causes
+        // the Execution stage to report completion early.
+        let target = match (self.max_block, previous_stage) {
+            (Some(max_block), Some(prev)) => Some(max_block.min(prev)),
+            (a, b) => a.or(b),
+        };
 
         loop {
             let prev_checkpoint = self.provider_factory.get_stage_checkpoint(stage_id)?;
