@@ -9,7 +9,7 @@ use reth_cli_util::allocator::tikv_jemalloc_sys as _;
 
 #[cfg(all(feature = "jemalloc-prof", unix))]
 #[unsafe(export_name = "malloc_conf")]
-static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
+static MALLOC_CONF: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\0";
 
 use clap::Parser;
 use reth::cli::Cli;

@@ -61,7 +61,7 @@ use reth_node_metrics::{
     chain::ChainSpecInfo,
     hooks::Hooks,
     recorder::install_prometheus_recorder,
-    server::{MetricServer, MetricServerConfig},
+    server::{activate_jemalloc_heap_profiling, MetricServer, MetricServerConfig},
     version::VersionInfo,
 };
 use reth_provider::{
@@ -626,6 +626,10 @@ where
 
     /// Starts the prometheus endpoint.
     pub async fn start_prometheus_endpoint(&self) -> eyre::Result<()> {
+        if self.node_config().debug.heap_profile {
+            Self::activate_heap_profiling();
+        }
+
         // ensure recorder runs upkeep periodically
         install_prometheus_recorder().spawn_upkeep();
 
@@ -655,6 +659,15 @@ where
         }
 
         Ok(())
+    }
+
+    /// Activates jemalloc heap profiling if the binary was compiled with `jemalloc-prof`.
+    fn activate_heap_profiling() {
+        if activate_jemalloc_heap_profiling() {
+            info!(target: "reth::cli", "Jemalloc heap profiling activated");
+        } else {
+            warn!(target: "reth::cli", "--debug.heap-profile: failed to activate jemalloc profiling (binary may not be compiled with jemalloc-prof)");
+        }
     }
 
     /// Convenience function to [`Self::init_genesis`]

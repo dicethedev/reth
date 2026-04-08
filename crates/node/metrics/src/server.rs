@@ -412,6 +412,31 @@ fn handle_pprof_heap(_pprof_dump_dir: &PathBuf) -> Response<Full<Bytes>> {
     response
 }
 
+/// Activates jemalloc heap profiling at runtime.
+///
+/// Requires the binary to be compiled with `jemalloc-prof` and initialized with
+/// `prof:true` in `MALLOC_CONF`. When `prof_active` is initially `false`, calling this
+/// enables sampling with zero overhead until activation.
+#[cfg(all(feature = "jemalloc-prof", unix))]
+pub fn activate_jemalloc_heap_profiling() -> bool {
+    match jemalloc_pprof::PROF_CTL.as_ref() {
+        Some(prof_ctl) => match prof_ctl.try_lock() {
+            Ok(mut ctl) => match ctl.activate() {
+                Ok(()) => true,
+                Err(_) => false,
+            },
+            Err(_) => false,
+        },
+        None => false,
+    }
+}
+
+/// No-op when `jemalloc-prof` is not compiled in.
+#[cfg(not(all(feature = "jemalloc-prof", unix)))]
+pub fn activate_jemalloc_heap_profiling() -> bool {
+    false
+}
+
 #[cfg(tokio_unstable)]
 async fn handle_tokio_dump() -> Response<Full<Bytes>> {
     let handle = tokio::runtime::Handle::current();
