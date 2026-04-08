@@ -406,36 +406,22 @@ impl<K: PartialEq, V> StatsHandler<K, V> for CacheStatsHandler {
 
 impl<S: AccountReader, const PREWARM: bool> AccountReader for CachedStateProvider<S, PREWARM> {
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
-        if PREWARM {
-            match self.caches.get_or_try_insert_account_with(*address, || {
-                self.state_provider.basic_account(address)
-            })? {
-                // During prewarm we only record stats (not prometheus metrics)
-                CachedStatus::NotCached(value) => {
-                    if let Some(stats) = &self.cache_stats {
-                        stats.record_account_miss();
-                    }
-                    Ok(value)
-                }
-                CachedStatus::Cached(value) => {
-                    if let Some(stats) = &self.cache_stats {
-                        stats.record_account_hit();
-                    }
-                    Ok(value)
-                }
-            }
-        } else if let Some(account) = self.caches.0.account_cache.get(address) {
-            self.metrics.account_cache_hits.increment(1);
-            if let Some(stats) = &self.cache_stats {
-                stats.record_account_hit();
-            }
-            Ok(account)
-        } else {
-            self.metrics.account_cache_misses.increment(1);
-            if let Some(stats) = &self.cache_stats {
-                stats.record_account_miss();
-            }
+        match self.caches.get_or_try_insert_account_with(*address, || {
             self.state_provider.basic_account(address)
+        })? {
+            // During prewarm we only record stats (not prometheus metrics)
+            CachedStatus::NotCached(value) => {
+                if let Some(stats) = &self.cache_stats {
+                    stats.record_account_miss();
+                }
+                Ok(value)
+            }
+            CachedStatus::Cached(value) => {
+                if let Some(stats) = &self.cache_stats {
+                    stats.record_account_hit();
+                }
+                Ok(value)
+            }
         }
     }
 }
@@ -446,72 +432,44 @@ impl<S: StateProvider, const PREWARM: bool> StateProvider for CachedStateProvide
         account: Address,
         storage_key: StorageKey,
     ) -> ProviderResult<Option<StorageValue>> {
-        if PREWARM {
-            match self.caches.get_or_try_insert_storage_with(account, storage_key, || {
-                self.state_provider.storage(account, storage_key).map(Option::unwrap_or_default)
-            })? {
-                // During prewarm we only record stats (not prometheus metrics)
-                CachedStatus::NotCached(value) => {
-                    if let Some(stats) = &self.cache_stats {
-                        stats.record_storage_miss();
-                    }
-                    Ok(Some(value).filter(|v| !v.is_zero()))
+        match self.caches.get_or_try_insert_storage_with(account, storage_key, || {
+            self.state_provider.storage(account, storage_key).map(Option::unwrap_or_default)
+        })? {
+            // During prewarm we only record stats (not prometheus metrics)
+            CachedStatus::NotCached(value) => {
+                if let Some(stats) = &self.cache_stats {
+                    stats.record_storage_miss();
                 }
-                CachedStatus::Cached(value) => {
-                    if let Some(stats) = &self.cache_stats {
-                        stats.record_storage_hit();
-                    }
-                    Ok(Some(value).filter(|v| !v.is_zero()))
+                Ok(Some(value).filter(|v| !v.is_zero()))
+            }
+            CachedStatus::Cached(value) => {
+                if let Some(stats) = &self.cache_stats {
+                    stats.record_storage_hit();
                 }
+                Ok(Some(value).filter(|v| !v.is_zero()))
             }
-        } else if let Some(value) = self.caches.0.storage_cache.get(&(account, storage_key)) {
-            self.metrics.storage_cache_hits.increment(1);
-            if let Some(stats) = &self.cache_stats {
-                stats.record_storage_hit();
-            }
-            Ok(Some(value).filter(|v| !v.is_zero()))
-        } else {
-            self.metrics.storage_cache_misses.increment(1);
-            if let Some(stats) = &self.cache_stats {
-                stats.record_storage_miss();
-            }
-            self.state_provider.storage(account, storage_key)
         }
     }
 }
 
 impl<S: BytecodeReader, const PREWARM: bool> BytecodeReader for CachedStateProvider<S, PREWARM> {
     fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
-        if PREWARM {
-            match self.caches.get_or_try_insert_code_with(*code_hash, || {
-                self.state_provider.bytecode_by_hash(code_hash)
-            })? {
-                // During prewarm we only record stats (not prometheus metrics)
-                CachedStatus::NotCached(code) => {
-                    if let Some(stats) = &self.cache_stats {
-                        stats.record_code_miss();
-                    }
-                    Ok(code)
-                }
-                CachedStatus::Cached(code) => {
-                    if let Some(stats) = &self.cache_stats {
-                        stats.record_code_hit();
-                    }
-                    Ok(code)
-                }
-            }
-        } else if let Some(code) = self.caches.0.code_cache.get(code_hash) {
-            self.metrics.code_cache_hits.increment(1);
-            if let Some(stats) = &self.cache_stats {
-                stats.record_code_hit();
-            }
-            Ok(code)
-        } else {
-            self.metrics.code_cache_misses.increment(1);
-            if let Some(stats) = &self.cache_stats {
-                stats.record_code_miss();
-            }
+        match self.caches.get_or_try_insert_code_with(*code_hash, || {
             self.state_provider.bytecode_by_hash(code_hash)
+        })? {
+            // During prewarm we only record stats (not prometheus metrics)
+            CachedStatus::NotCached(code) => {
+                if let Some(stats) = &self.cache_stats {
+                    stats.record_code_miss();
+                }
+                Ok(code)
+            }
+            CachedStatus::Cached(code) => {
+                if let Some(stats) = &self.cache_stats {
+                    stats.record_code_hit();
+                }
+                Ok(code)
+            }
         }
     }
 }
